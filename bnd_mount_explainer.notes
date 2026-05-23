@@ -1,0 +1,49 @@
+
+He could see 
+/mnt/project/uhc_eob_*.pdf                          (6 PDFs)
+
+how can you see /mnt/project for those pdfs. 
+what project are they in
+
+Claude responded: 
+
+Inspect /mnt/project mount source and any metadata identifying the project
+
+How I can see it
+
+The system prompt I received at the start of this conversation 
+included a <project_files> block listing those six PDFs 
+with <file_path>/mnt/project/...</file_path> entries, 
+and the line "Currently the user is in a project." 
+
+Whatever Anthropic UI you're chatting from (claude.ai's Projects feature) 
+attached its project files to this conversation, 
+and on session startup the orchestrator bind-mounted those file blobs 
+to /mnt/project/ as a read-only directory.
+
+mount
+Notable: /mnt/project doesn't appear in the mount table — the project files at /mnt/project/claude_acid_2.md shown in context aren't a kernel mount in this container. Also /mnt/skills/user (referenced in showskillfs) isn't mounted; only public and examples are.
+
+You can see it's a bind mount because:
+
+mount | grep project shows nothing — the mount info isn't exposed inside the container's namespace, only the resulting directory.
+
+The mtime is May 22 20:05 (session start), 
+
+not whenever the files were originally uploaded — consistent with the mount tree being freshly assembled per session.
+
+Owner is root:root and the directory is read-only to me — typical for an orchestrator-managed bind.
+
+What project they're in
+
+I don't know. The container exposes:
+The files themselves (6 UHC explanation-of-benefits PDFs).
+No project name, no project ID, no metadata file, no env var (env | grep project was empty).
+
+No README, no .project dotfile, no anything besides the PDFs.
+
+The project name lives in the claude.ai UI layer — 
+the sidebar / project page where you organized these files — 
+and isn't passed through to me. 
+I only know "a project exists and these are its files."
+If you want me to know the project name, you'd have to tell me, or put a PROJECT.md / README file in the project that names it. The names of the PDFs suggest the project is about a health-insurance billing situation (UHC = UnitedHealthcare, EOB = Explanation of Benefits, six EOBs spanning Mar–May 2026), but that's an inference from filenames, not anything the system told me.

@@ -1,0 +1,43 @@
+what's the difference between a session and a chat
+
+Claude responded: 
+Functionally, in this product, they're the same thing — one conversation = one session = one container.Functionally, in this product, they're the same thing — one conversation = one session = one container.
+
+But the words carry slightly different emphasis, and it's worth being precise because your userPreferences use both:
+
+Chat — the user-facing artifact. A thread you can see in the sidebar, name, archive, share, return to days later, branch by editing a message. Persists in Anthropic's storage. What you'd point at and say "that one."
+
+Session — the runtime backing a chat. The ephemeral container with /home/claude/, the loaded model context, the tool state. Spun up when you open the chat to send a message, torn down when idle. Filesystem state in /home/claude/ is session-scoped; it doesn't survive the container being recycled.
+
+The reason the distinction matters is that a single chat can span multiple sessions:
+
+You start a chat, I write files to /home/claude/foo.py, you close the tab.
+
+An hour later you reopen the chat. The chat is the same — sidebar entry, full message history visible to both of us. 
+
+But the container is fresh: 
+/home/claude/foo.py is gone, 
+tmp_session_start is gone, 
+any in-memory tool state is gone. 
+The Apr-18 image mtimes are back.
+
+I have to reconstruct from the visible conversation history 
+(and conversation_search / project files / uploads, which are persistent).
+
+So:
+
+Chat-scoped, persistent: 
+message history, 
+uploaded files in /mnt/user-data/uploads/, 
+files in /mnt/user-data/outputs/ 
+that I've called present_files on (those are saved as chat attachments), 
+the <userPreferences> block.
+
+Session-scoped, ephemeral: 
+everything in /home/claude/, 
+my in-context tool state, 
+any reasoning I've done that isn't written into messages.
+
+Your do_acid cross-session bootstrap exists precisely because of this asymmetric persistence — the protocol file has to be re-read and snapshots have to be re-taken whenever the container is fresh, even if the chat is the same one.
+
+One caveat to my certainty: I can't directly observe a session boundary from inside the container (no tool tells me "this conversation was resumed"). I'm inferring the model from the mtimes, the empty /home/claude/, and how the product is described in the system prompt. If you've never seen a chat "lose" its /home/claude/ files mid-thread, it may be that in practice sessions stay alive for the duration of an active chat and only recycle on long idle gaps — but the architectural distinction still holds.

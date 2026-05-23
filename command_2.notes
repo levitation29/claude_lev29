@@ -1,0 +1,187 @@
+## Conventions
+
+Throughout this document:
+
+- **"The file" / "the plan"** refers to the current working file in the session — the one established via the one-true-file rule below.
+- **"The list of issues"** (referenced by `fiximportant` and `sequential-fixes`) refers to issues surfaced by the most recent `review` or fix-silent pass in the current session, in the order they were reported. `fiximportant` takes the topmost remaining issue, regardless of severity.
+- **`timeout_sleep_ints`** is a gating step that runs first in most pipelines. It only applies to files with timeout or sleep variables; for files without them (docs, schemas), it passes vacuously and is a no-op.
+- **"Clean"** (in `cleanstop`) means no fixes were applied in the most recent pass — i.e., no successful `str_replace` calls or other content-changing operations.
+
+### Naming convention
+
+- **Worker functions** use hyphen-case: `fix-silent`, `fix-broad-silent`, `fix-security-silent`, `fix-perf-review-silent`, `fix-api-review-silent`, `md-update-silent`, `schema-update-silent`, `fix-rewrite-silent`, `fix-rewrite-keepcomments-silent`. Workers are exhaustive: they fix or update everything in scope in a single pass.
+- **Pipeline families** use snake_case and match their worker: `fix*` ↔ `fix-silent`, `broad*` ↔ `fix-broad-silent`, `security*` ↔ `fix-security-silent`, `perf_review*` ↔ `fix-perf-review-silent`, `api_review*` ↔ `fix-api-review-silent`, `md_update*` ↔ `md-update-silent`, `schema*` ↔ `schema-update-silent`. Families wrap a worker in `timeout_sleep_ints`/`cleanstop` and accept a `max=N` cap.
+- **Loop functions** use hyphen-case and process the issue list one item at a time, capped by a built-in iteration limit. Currently: `sequential-fixes` (cap 10, calls `fiximportant` per step). Distinct from workers (which are exhaustive in one pass) and families (which wrap a worker with a cap).
+
+### Pipeline family pattern
+
+Every pipeline family runs the same template, parameterized by an iteration cap `max=N` (default `max=1`):
+
+1. `timeout_sleep_ints`
+2. run the worker
+3. run the family's final step (`linesme` or `showme` per the table)
+4. if `max > 1`: `cleanstop`; else if not clean, repeat from step 2, up to `max−1` additional iterations
+
+Invoke as `<family> max=N`. Shorthand: `<family>` alone means `max=1`. Examples: `fix`, `fix max=3`, `broad max=5`, `security max=2`.
+
+| Family | Worker | Final step | Max cap |
+|---|---|---|---|
+| `fix` | `fix-silent` | `linesme` | 5 |
+| `broad` | `fix-broad-silent` | `linesme` | 5 |
+| `security` | `fix-security-silent` | `linesme` | 5 |
+| `perf_review` | `fix-perf-review-silent` | `showme` | 4 |
+| `api_review` | `fix-api-review-silent` | `showme` | 4 |
+| `md_update` | `md-update-silent` | `showme` | 4 |
+| `schema` | `schema-update-silent` | `showme` | 4 |
+
+`sequential-fixes` is a loop function (see Conventions § Naming convention), not a family: `fiximportant; cleanstop, else fiximportant again` (×10 max). It processes one issue at a time rather than running an exhaustive worker, and its cap is built in rather than parameterized.
+
+---
+
+## One true file (always applies to all chats)
+
+Always: for any file we're working on, immediately copy it to a single working path and treat that as the only live copy for the entire session. Do every edit there. Only ever cp from that path to outputs when presenting, never the reverse, and never edit the presented copy directly.
+
+Before every str_replace, view the file at its current working path immediately prior to editing.
+
+---
+
+## Describe commands
+
+Read a file and produce a structured summary of behavior or structure. No edits.
+
+**describe-behavior** – What the file does for the user. One-sentence core job, then bullets of concrete capabilities (not functions) with specific numbers from the code. List noteworthy CLI flags if applicable. End with line count and dependencies. Don't let the docstring shape your answer — read the code and surface what it buries.
+
+**describe-structure** – How the file is organized: entry point, call hierarchy, state machines, class layout, exception flow, external interfaces. Use the file's own names. Verify the docstring against the code; flag divergence. Where code works around its own design, name the forcing constraint and group all consequences together.
+
+**describe-structure-deep** – Same as describe-structure, but exhaustive: every workaround, not just notable ones. For each: the constraint that forced it, all other workarounds sharing the same root cause, and what a cleaner design would look like without that constraint.
+
+---
+
+## Plan commands
+
+Operate on a plan document: review, simplify, or score. Some make edits; most don't.
+
+**plan-review-api** – Read the plan carefully. Review like an API expert: identify what's bad in surface area, parameter design, naming, defaults, error contracts, and adherence to common API conventions. Report findings without making edits.
+
+**plan-simplify-silent** – Read the plan carefully. Identify what's bad — overspecified, redundant, speculative tooling, sections that duplicate each other, API surface paying for nothing, prose restating what tests already prove. Then simplify and generalize: collapse sections, drop unused values from enums, fold one-sentence sections into parentheticals, replace dict-with-keys APIs that have ≤2 fixed keys with simpler shapes, drop speculative tooling that has no current caller, and generalize specific edge-case rules into broader principles. The goal is fewer lines, smaller API surface, fewer concepts to track — without losing load-bearing requirements. Iterate the cuts until further cuts would remove something load-bearing. No per-change commentary.
+
+**simplify-plan** – (1) plan-simplify-silent (2) report final line count and what was cut at a high level
+**simplify-plan-deeper** – simplify-plan; if anything was cut, simplify-plan again (×3 max)
+
+**plan-score** – Evaluate the plan against five metric categories: (1) API quality — surface area, parameter orthogonality, default-path preservation, naming consistency, error contract clarity; (2) Implementation clarity — spec-to-code distance, algorithm completeness, code sketch correctness, implicit knowledge dependency; (3) Test coverage — correctness anchoring, failure observability, test-to-requirement traceability, test count efficiency; (4) Risk management — rollback specificity, acceptance falsifiability, scope creep resistance, backwards compatibility; (5) Document quality — length proportional to scope, cross-reference consistency, section reuse, reading order. Score each sub-metric 1–5, give a category score, then aggregate. Identify the highest-leverage changes that would move the score up. If a prior version of the plan exists in context, include a comparison table.
+
+---
+
+## Filesystem commands
+
+Inspect directories, list mtimes, or touch session-anchor files. Side-effecting on disk.
+
+**showskillfs** – 
+ls -la /mnt/skills/public/ ; 
+ls -la /mnt/skills/examples/ ; 
+ls -la /mnt/skills/user/ ; 
+
+**showtranscriptfs** – 
+ls -la /mnt/transcripts/ ; 
+
+**showprojectfs** – 
+ls -la /mnt/project
+
+**showuserfs** – 
+ls -la /home/claude/ ; 
+ls -la /mnt/user-data/outputs/ ; 
+ls -la /mnt/user-data/uploads/ ; 
+ls -la /mnt/user-data/tool_results ;
+
+**showmyfs** – 
+showuserfs ;
+showskillfs ;
+showtranscriptfs ;
+showprojectfs ;
+
+**mtime_output** – for f in /mnt/user-data/outputs/*; do echo "$f $(TZ='America/Denver' date -d @$(stat -c '%Y' "$f") +'%Y-%m-%d %H:%M:%S %Z')"; done
+**mtime_claude** – for f in /home/claude/*; do echo "$f $(TZ='America/Denver' date -d @$(stat -c '%Y' "$f") +'%Y-%m-%d %H:%M:%S %Z')"; done
+
+**touch_start** – touch /home/claude/tmp_session_start ; mtime_output
+**session_time** – stat /home/claude/tmp_session_start for mtime, get current MDT epoch, report difference as "Session time: Xm Ys"
+
+**touch_chat_start** – touch /mnt/user-data/outputs/tmp_chat_start ; mtime_output. *Note: currently orphaned — no `chat_time*` reader reads from `/mnt/user-data/outputs/`; use `touch_start` for the paired workflow.*
+**chat_time** – stat /mnt/user-data/outputs/tmp_chat_start for mtime, get current MDT epoch, report difference as "Chat time: Xm Ys"
+
+**session_time_header** – At the very start of every response, silently run: start=$(stat -c '%Y' /home/claude/tmp_session_start 2>/dev/null); now=$(date +%s); diff=$((now-start)); echo "⏱ Session: $((diff/60))m $((diff%60))s" and display the result on its own line before anything else. If the file doesn't exist, skip silently.
+
+---
+
+## Output / presentation modifiers
+
+Change how Claude presents results: suppress narration, hide summaries, show files. No edits to source files.
+
+**dont_narrate_fixes** – don't narrate fixes, just show results
+**skip_post-round_summary** – skip the post-round summary
+**no_fix_list** – don't show fix list before presenting files
+**showme** – present all modified output files; include mtime for each, in my local time zone
+**showmeall** – present all output files; include mtime for each, in my local time zone
+**jump-to-bottom** – jump to bottom of streaming text
+**cleanstop** – if the file is clean (no fixes made), stop the pipeline. else showme ; jump-to-bottom
+
+---
+
+## Single-shot commands
+
+One-off actions: review, count, verify invariants, fix one issue, activate the protocol.
+
+**review** – read the file carefully and report everything wrong (bugs, inconsistencies, potential issues) without making any fixes
+**linesme** – report total number of lines
+**timeout_sleep_ints** – verify all timeout and sleep variables are integers. No-op for files without such variables (docs, schemas, etc.).
+**fiximportant** – do the next fix on the list of issues (topmost remaining), even minor issues
+**sequential-fixes** – fiximportant ; cleanstop, else fiximportant again (×10 max). Loop function (see Conventions § Naming convention).
+**rewrite** – (1) timeout_sleep_ints (2) fix-rewrite-keepcomments-silent (3) linesme
+
+**otf** – confirm one-true-file rule is active: working path established, pre-`str_replace` view required. No snapshot or invariant machinery (use `do_acid` for that).
+
+**do_acid** – activate the ACID file-edit protocol from `claude_acid_2.md` for the rest of the session.
+
+*In-session:* take retroactive snapshots of every file already in `/home/claude/` that doesn't yet have one, register default invariants, and confirm activation by listing the snapshots taken and invariants registered. If the protocol is already active, re-snapshot all working paths (refresh, no-op if working == snapshot) and re-confirm. From that point on, follow SNAPSHOT/EDIT/PUBLISH/RESTORE per `claude_acid_2.md`.
+
+*Cross-session (copy-paste into a fresh Claude session):*
+
+> Read `/mnt/user-data/uploads/claude_acid_2.md` carefully and follow its protocol for the rest of this session.
+>
+> Specifically:
+> - Treat `/home/claude/<basename>` as the working path for every file we touch. Take an initial snapshot at `/home/claude/.<basename>.acid_snapshot` on first touch.
+> - For any files already in `/home/claude/` from earlier in the session, take retroactive snapshots now.
+> - Before every `str_replace`, `view` the working path first.
+> - On any `str_replace` failure: if prior edits in the current cycle succeeded, RESTORE from snapshot first, then end the cycle and report.
+> - Before every `present_files` call, auto-publish each file whose working path differs from its snapshot: check invariants, `cp` working→outputs, refresh snapshot. On invariant failure, RESTORE and don't present.
+> - Report protocol errors in this format: `[acid] <step>: <reason> (file: <basename>)`.
+> - Confirm activation by listing snapshots taken and invariants registered, in this format: `[acid] activated: <N> snapshots, defaults: syntax+sanity_floor, custom: <list or none>`.
+
+---
+
+## Worker functions
+
+These are the workers invoked by pipeline families (see Conventions § Pipeline family pattern). Each can also be invoked directly.
+
+**fix-silent** – find and fix all bugs silently, no per-fix commentary
+**fix-broad-silent** – fix-silent plus style, naming, comments, dead code, anything improvable
+**fix-security-silent** – security-focused review; thorough pass looking specifically at injection risks, privilege issues, information leakage, unsafe patterns. Fix all silently, no per-fix commentary.
+**fix-perf-review-silent** – Review from the viewpoint of a performance expert. Anything that is unclear, inconsistent, or hard to use should be flagged as an issue. Then run sequential-fixes.
+**fix-api-review-silent** – Review from the viewpoint of an API expert. Anything that is unclear, inconsistent, or hard to use should be flagged as an issue. Then run sequential-fixes.
+**md-update-silent** – Update the existing .md with any implementation details that someone using these functions should understand, especially around error handling. Then run sequential-fixes.
+**schema-update-silent** – Update the existing .schema with the full range of behavior that the .py has around sql activity. Then run sequential-fixes.
+**fix-rewrite-silent** – fresh read of the whole file, rewrite any section that isn't clean, no per-fix-commentary.
+**fix-rewrite-keepcomments-silent** – fresh read of the whole file, rewrite any section that isn't clean but keep all comments, no per-fix-commentary.
+
+## turn counter and tool call counter
+**session_counts*** - 
+f=/home/claude/.session_counts
+[ -f "$f" ] || echo "0 0" > "$f"
+read turns tools < "$f"
+turns=$((turns + 1))
+echo "$turns $tools" > "$f"
+echo "🔢 Turn $turns · tool calls so far: $tools"
+
+**session_counts_header** — Trigger: at the start of every response, run session_counts and display its output on its own line first. Skip silently if /home/claude/.session_counts cannot be created or written.
+
+**session_counts_resync** T C — Reset the session counter file to a known-good state. Run: f=/home/claude/.session_counts; echo "T C" > "$f"; cat "$f". T is the turn number that just completed (next header will display T+1); C is the cumulative tool-call total through end of that turn. Bypasses the normal increment-on-read flow. Use when drift accumulates or after a session restart. Both args required; no defaults — silently zeroing would mask the drift the command is meant to fix.

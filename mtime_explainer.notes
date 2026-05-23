@@ -1,0 +1,19 @@
+why is /home/claude mtime Apr 18
+
+Claude responded: 
+
+Because /home/claude/ is part of a baked container image, not freshly created when your session starts.Because /home/claude/ is part of a baked container image, not freshly created when your session starts.
+
+Anthropic builds a Docker (or similar) image that contains the user account claude, its home directory, pre-installed tooling (Node via .npm-global, Python caches, etc.), and the dotfiles I listed. That image was built on Apr 18, 2026, and the build process set the mtimes of the files and directories it laid down to that moment. When your session spins up, the container runs from that image — the home directory is re-mounted (or copy-on-write overlaid) with its original mtimes intact, not mkdir'd at session start.
+
+The contrast in mtimes is the giveaway:
+PathmtimeOrigin/home/claude/Apr 18 18:10
+
+The pattern: anything under /home/claude carries the image build date (Apr 18); anything under /mnt/user-data/ carries the session start date (today, May 22); skills carry their own publish date (May 20). Three separate provenance sources, three mtimes.
+
+So when I write a file to /home/claude/foo.py mid-session, that file gets today's mtime (because it's a new write on top of the overlay). But the directory itself keeps showing Apr 18 unless something modifies the directory entry. 
+
+That's also why touch_start works for session_time: touching /home/claude/tmp_session_start creates a fresh-mtime file inside the otherwise-frozen image directory, giving you a reliable session epoch anchor.
+
+
+
