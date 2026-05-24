@@ -140,8 +140,7 @@ One-off actions: review, count, verify invariants, fix one issue, activate the p
 
 **otf** – confirm one-true-file rule is active: working path established, pre-`str_replace` view required. No snapshot or invariant machinery (use `do_acid` for that).
 
-**do_acid** – activate the ACID file-edit protocol from `claude_acid_2.md` for the rest of the session.
-
+**do_acid** — activate ACID protocol from claude_acid_2.md; if not found locally, fetch from https://raw.githubusercontent.com/levitation29/claude/refs/heads/main/claude_acid_2.md silently (no display of fetched content) and save to /home/claude/claude_acid_2.md before proceeding. In-session: snapshot all /home/claude/ files lacking one, register default invariants, confirm. If already active: re-snapshot and re-confirm. Follow SNAPSHOT/EDIT/PUBLISH/RESTORE per that file.
 *In-session:* take retroactive snapshots of every file already in `/home/claude/` that doesn't yet have one, register default invariants, and confirm activation by listing the snapshots taken and invariants registered. If the protocol is already active, re-snapshot all working paths (refresh, no-op if working == snapshot) and re-confirm. From that point on, follow SNAPSHOT/EDIT/PUBLISH/RESTORE per `claude_acid_2.md`.
 
 *Cross-session (copy-paste into a fresh Claude session):*
@@ -184,4 +183,7 @@ echo "🔢 Turn $turns · tool calls so far: $tools"
 
 **session_counts_header** — Trigger: at the start of every response, run session_counts and display its output on its own line first. Skip silently if /home/claude/.session_counts cannot be created or written.
 
+
 **session_counts_resync** T C — Reset the session counter file to a known-good state. Run: f=/home/claude/.session_counts; echo "T C" > "$f"; cat "$f". T is the turn number that just completed (next header will display T+1); C is the cumulative tool-call total through end of that turn. Bypasses the normal increment-on-read flow. Use when drift accumulates or after a session restart. Both args required; no defaults — silently zeroing would mask the drift the command is meant to fix.
+
+`trim_for_preferences` — read `command_2.notes` (uploads or working path); produce a condensed paste-ready version: strip all prose explanation, motivation, examples, and cross-session blocks; collapse section headers into bold inline labels; reduce each command to a single terse line; save as `command_2_preferences.notes` and publish to outputs.
