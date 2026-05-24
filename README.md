@@ -16,78 +16,78 @@ every defined shortcut in command_2*
 
 **Describe**
 
-describe-behavior
-describe-structure
-describe-structure-deep
+describe-behavior  
+describe-structure  
+describe-structure-deep  
 
 **Plan**
 
-plan-review-api
-plan-simplify-silent
-simplify-plan
-simplify-plan-deeper
-plan-score
+plan-review-api    
+plan-simplify-silent    
+simplify-plan    
+simplify-plan-deeper    
+plan-score  
 
 **Filesystem**
 
-showskillfs
-showtranscriptfs
-showprojectfs
-showuserfs
-showmyfs
-mtime_output
-mtime_claude
-touch_start
-session_time
-touch_chat_start
-chat_time
-session_time_header
+showskillfs  
+showtranscriptfs  
+showprojectfs  
+showuserfs  
+showmyfs  
+mtime_output  
+mtime_claude  
+touch_start  
+session_time  
+touch_chat_start  
+chat_time  
+session_time_header  
 
 **Output modifiers**
 
-dont_narrate_fixes
-skip_post-round_summary
-no_fix_list
-showme
-showmeall
-jump-to-bottom
-cleanstop
+dont_narrate_fixes  
+skip_post-round_summary  
+no_fix_list  
+showme  
+showmeall  
+jump-to-bottom  
+cleanstop  
 
 **Single-shot**
 
-review
-linesme
-timeout_sleep_ints
-fiximportant
-sequential-fixes
-rewrite
-otf
-do_acid
+review  
+linesme  
+timeout_sleep_ints  
+fiximportant  
+sequential-fixes  
+rewrite  
+otf  
+do_acid  
 
 **Workers**
 
-fix-silent
-fix-broad-silent
-fix-security-silent
-fix-perf-review-silent
-fix-api-review-silent
-md-update-silent
-schema-update-silent
-fix-rewrite-silent
-fix-rewrite-keepcomments-silent
+fix-silent  
+fix-broad-silent  
+fix-security-silent  
+fix-perf-review-silent  
+fix-api-review-silent  
+md-update-silent  
+schema-update-silent  
+fix-rewrite-silent  
+fix-rewrite-keepcomments-silent  
 
 **Counters**
 
-session_counts
-session_counts_header
-session_counts_resync T C
+session_counts  
+session_counts_header  
+session_counts_resync T C  
 
 **Pipeline families**
 
-fix
-broad
-security
-perf_review
-api_review
-md_update
-schema
+fix  
+broad  
+security  
+perf_review  
+api_review  
+md_update  
+schema  
