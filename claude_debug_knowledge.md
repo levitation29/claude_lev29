@@ -261,6 +261,42 @@ isn't public. The monitor therefore has **two sources**, in priority order:
    output the decoded text deltas. **The `~` marker means heuristic and nothing
    else** — it never appears on an exact (API) number anywhere in the UI.
 
+**What the schema probe confirmed about claude.ai (vs the public API):**
+
+- **No `usage` object in the stream.** claude.ai's internal completion stream does
+  **not** emit `usage`, so on claude.ai every turn is heuristic (`tokensReal:false`)
+  — the exact path only fires against the public Anthropic API. This is expected,
+  not a fault, and the probe now reports it as info, not a warning.
+- **Input is NEW-TURN ONLY.** The request body carries `prompt` + `turn_message_uuids`
+  — prior turns are referenced by UUID, **not inlined** — so `inChars` / `inputTokens`
+  reflect only the new message, not the full context. Treat input figures as
+  per-turn input, never as total context.
+- **Output is split into thinking vs answer.** Extended-reasoning turns stream
+  `thinking` / `summary` deltas alongside `text`; the monitor records `thinkingChars`
+  and `answerChars` separately (`out` = both). A `message_limit` event (claude.ai
+  specific) is captured whole on the turn record (`messageLimit`). **Confirmed schema:**
+  the flat `remaining` / `resetsAt` / `perModelLimit` are usually `null`; the real quota
+  lives in `windows` — keyed by window (`5h`, `7d`), each `{ status, resets_at (unix
+  SECONDS), utilization 0..1 }`. `representativeClaim` names the binding window;
+  `overageInUse` / `overageDisabledReason` (e.g. `out_of_credits`) describe overage. The
+  monitor parses this into a live HUD "quota" line (`<window> N% left (resets in …)`),
+  surfaces it in `assess()` (warns at ≥80% used) and the `[PERF]` line, and includes a
+  structured `quota` block in `audit()` so utilization can be tracked across snapshots.
+- **`compaction_status` event.** claude.ai emits this when it compacts a conversation's
+  context mid-stream; it's captured on the turn as `compaction` and noted by the probe.
+- **Per-turn metadata is captured from the body:** `model`, `thinking_mode`,
+  `effort`, and counts of `tools` / `attachments` / `files` — so turns can be read
+  by model and mode. `stop_reason` (+ `stop_details`) is captured from `message_delta`.
+- **In-stream errors are captured.** claude.ai delivers failures as an `error` SSE
+  event over an HTTP 200 response (e.g. `overloaded_error`, rate/limit). The monitor
+  records it on the turn as `streamError`, counts it (`streamErrorCount`), and the
+  probe reports it explicitly rather than the misleading "no content deltas". A turn
+  that errors emits no `message_limit`, so quota data won't appear on it.
+- **Thinking timing & share.** `ttftThink` (first thinking delta) yields `reasonedMs`
+  = time reasoning before the first answer token; `thinkingShare` = thinking ÷
+  (thinking + answer); `answerTok` / `answerTokPerSec` report answer-only throughput
+  (excludes thinking), so perceived speed isn't inflated by reasoning.
+
 What the figures are good for and not:
 
 - **Good for:** usage *rates* and trends — messages/hour, messages/day, approx
@@ -279,8 +315,12 @@ click to expand a live readout of turns, **session & chat time** (with gen/idle)
 median/p90 total, median TTFT, estimated tokens, and last-1h / last-24h / per-day
 rates, refreshing every `HUD_REFRESH_MS`.
 Header buttons: **📊 histogram**, **🔬 schema probe**, **💡 assess**,
-**⧉ copy JSON**, **▾ collapse**, **× hide**.
+**⧉ copy JSON**, **🧾 copy audit snapshot** (for `hud_audit`), **▾ collapse**, **× hide**.
 Toggle from code with `_claudeDebug.hud()` / `hud(true)` / `hud(false)`.
+**Drag it anywhere:** grab the header (the title area — buttons still click normally)
+and drag to reposition the panel. It clamps to the viewport and the position is
+remembered across reloads (best-effort `localStorage`, key `claudeDebugHudPos`). A
+drag won't trigger the collapse-on-click; clear the key to reset to top-right.
 
 The **🔬 probe** and **💡 assess** buttons render their verdicts into a
 color-coded on-page panel on the left edge (green PASS / amber CHECK / red FAIL),
@@ -342,8 +382,10 @@ does not.
   `cacheCreate` show separately (per-turn `[PERF]` "cache tokens" line; "cache rd"
   column in `rates()`). In a long cached thread `inputTokens` stays small while
   `cacheRead` climbs — that divergence *is* caching. **To reconstruct full prompt
-  size, add the three** — `rates()` shows a "total ctx" column that does this. The
-  summary's `tokensTotal` and the "in tok" roll-up use the **uncached**
+  size, add the three** — `rates()` shows an "in+cache" column that does this. On
+  claude.ai `cacheRead`/`cacheCreate` are null, so "in+cache" collapses to the
+  **new-turn** input and is *not* full context — the column is labelled accordingly.
+  The summary's `tokensTotal` and the "in tok" roll-up use the **uncached**
   `inputTokens`, so they reflect *fresh* consumption, not total context.
 - **Heuristic path (`src: ~`).** The monitor measures the *entire resent body
   every turn* and has **no concept of caching**, so its input estimate climbs
@@ -419,17 +461,27 @@ probe lets you confirm they still match. Arm it (🔬 button or
 the console **and** in an on-page panel (left edge, color-coded: green PASS /
 amber CHECK / red FAIL, with its own × to close):
 
-- request body parsed? top-level keys; content-char count; attachments excluded.
+- request body parsed? top-level keys; content-char count; inlined blobs excluded.
+  It also surfaces `model` / `thinking_mode` / `effort` / tool & attachment counts,
+  and notes that input is **new-turn only** (history is by-reference).
 - endpoint classified as a completion (so it counts as a message)?
 - conversation id parsed from the URL?
-- `usage` object present, and does it carry `input_tokens` / `output_tokens`
-  (+ cache fields)? If absent → tokens are heuristic.
-- content deltas recognized (`delta.text` / `partial_json`)? If a `delta` is
-  present but unrecognized → **FAIL**: output estimate is unreliable, update
-  `outputCharsFromEvent()`. The report lists the actual delta keys and event types.
+- `usage` object present? On claude.ai it is absent — reported as **info** (expected),
+  not a warning; if a `message_limit` event was seen, its keys are listed (it may
+  carry quota/usage data worth wiring up later).
+- content deltas recognized (`text` / `thinking` / `summary` / `partial_json`)?
+  Metadata-only deltas (`stop_reason`, `stop_sequence`, `message`, `display_content`,
+  …) are classified as metadata, not flagged as gaps. A genuinely unknown content
+  shape is a **FAIL** → update `outputCharsFromEvent()`. Delta keys + event types
+  are always listed.
+- error event? If the turn streamed an `error` (claude.ai's HTTP-200 failure shape),
+  the probe states the error type and that it's a claude.ai error/limit response, not
+  a parser problem — suppressing the otherwise-confusing "no content deltas" flag.
+- `compaction_status` event? Noted as info (context was compacted mid-stream).
 
 It analyzes one turn then disarms. The fastest way to detect — and fix — a
 claude.ai shape change that would otherwise silently degrade the token figures.
+The probe (and assess) verdicts also render in the on-page panel, color-coded.
 
 ### 4.5 Session time vs chat time (and engaged / idle)
 The HUD tracks three distinct clocks, all in JS, all separate from any
@@ -470,7 +522,14 @@ total, median TTFT) and flags, each with a recommendation where actionable:
   (default 0.3) on a long thread → caching isn't carrying your context (often from
   editing earlier messages).
 - **Throughput dips** — turns generating < `ASSESS.tpsDip`× the median tok/s (default 0.5).
-- **Errors** — fetch failures and 4xx/5xx counts.
+- **Errors** — fetch failures, 4xx/5xx counts, and in-stream `error` events
+  (`streamErrorCount`; HTTP-200 failures claude.ai returns mid-stream).
+- **Truncation** — share of turns with `stop_reason` `max_tokens` (answers cut at the
+  output cap) → recommends continuation / narrower scope.
+- **Tool round-trips** — turns ending in `tool_use` (multi-step/agentic), and a
+  thinking-heavy note when reasoning averages ≥50% of output.
+- **Quota** — the latest `message_limit` windows: each window's % left and reset
+  countdown; warns at ≥80% used; notes overage status (e.g. disabled / out_of_credits).
 - **Engaged vs idle** time for the session.
 
 Both the findings and the baseline render in the same on-page panel as the probe
@@ -502,10 +561,12 @@ Call with parentheses:
 | `_claudeDebug.calibration()` | the current self-calibrated chars/token and sample size |
 | `_claudeDebug.stats()` | min/median/p90/max for both TTFTs, stream, total |
 | `_claudeDebug.histogram(metric?, buckets?)` | ASCII histogram; metric ∈ `total`, `ttft`, `ttftEvent`, `streamDuration`, `outputTokens`, `inputTokens`, `tokPerSec`, `tokPerSecWall`, `interEventP95`, `cacheRead`, `reqBytes`, `streamBytes` |
-| `_claudeDebug.turns()` | per-turn table (timings, events, endpoint, in/out tokens, cacheRd, `src` API/~, tok/s, gapP95) |
+| `_claudeDebug.turns()` | per-turn table (timings, events, endpoint, in/out tokens, cacheRd, `src` API/~, **think** tok, **stop** reason, **model**, tok/s, gapP95) |
 | `_claudeDebug.pending()` / `.count()` | in-flight requests |
 | `_claudeDebug.sockets()` | WebSocket activity (recv/sent/state) |
 | `_claudeDebug.export()` | copy all turn data as JSON to clipboard |
+| `_claudeDebug.audit()` | copy a compact `hud_audit` snapshot (session summary + slim per-turn rows) for tracking trends over time |
+| `_claudeDebug.help()` | grouped list of every command (Reports / Visuals / Diagnostics / Data / Control) |
 | `_claudeDebug.reset()` | clear the turn log **and chat clocks** (keeps calibration, health, and the session clock) |
 | `_claudeDebug.resetAll()` | clear everything except the session clock (turns, sockets, chat clocks, calibration, health) |
 | `_claudeDebug.callers(on=true)` | toggle per-request caller-stack capture in `[REQ]` logs (off by default — a perf trade) |

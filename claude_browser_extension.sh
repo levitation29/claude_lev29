@@ -329,6 +329,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   // Health / capacity tracking (keyless, exact).
   let maxInFlight = 0;                 // peak concurrent monitored requests
   let failCount = 0;                   // fetch() rejections
+  let streamErrorCount = 0;            // SSE "error" events (claude.ai returns these with HTTP 200)
   const statusCounts = new Map();      // HTTP status -> count
   let lastRateLimit = null;            // latest anthropic-ratelimit-* / retry-after snapshot
   let probeArmed = false;              // schema-probe: analyze the next monitored SSE turn
@@ -336,6 +337,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   let slowP90 = null, slowP90At = 0;   // cached [SLOW] baseline + the turn count it was computed at
   const COMPLETION_RE    = /\/(retry_)?completion\b/i;            // a chat-completion stream (.../chat_conversations/<id>/completion)
   const SLOW_ENDPOINT_RE = /\/(retry_)?completion\b|upload-file\b/i; // slow by nature: stream TTFT or a file upload
+  const DELTA_META_KEYS  = ['type', 'index', 'stop_reason', 'stop_sequence', 'stop_details', 'message', 'display_content']; // non-content delta fields
 
   // Time tracking. SESSION = since the monitor loaded (page open, incl. idle);
   // CHAT = first turn -> last turn span; ENGAGED = summed turn durations (generating).
@@ -344,6 +346,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
 
   // On-page overlay (HUD) state
   let hudRoot = null, hudTitle = null, hudBody = null, hudFoot = null, hudInterval = null, hudCollapsed = true;
+  let hudPos = null;                   // {left, top} drag position (persisted best-effort)
   // Metrics the HUD 📊 button cycles through on repeated clicks.
   const HUD_HIST_METRICS = ['total', 'ttft', 'ttftEvent', 'streamDuration',
     'outputTokens', 'inputTokens', 'tokPerSec', 'interEventP95', 'reqBytes', 'streamBytes'];
@@ -360,6 +363,47 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     const s = Math.round(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
     return h ? `${h}h ${m}m` : m ? `${m}m ${sec}s` : `${sec}s`;
   };
+
+  // Parse a claude.ai message_limit payload into a usable shape. Real schema (confirmed):
+  // { type, representativeClaim, overageInUse, overageDisabledReason,
+  //   windows: { '5h': {status, resets_at (unix SECONDS), utilization 0..1}, '7d': {...} } }.
+  // The flat remaining/resetsAt fields are usually null — `windows` is the source of truth.
+  function quotaSummary(lim) {
+    if (!lim || typeof lim !== 'object') return null;
+    const ml = lim.windows ? lim : (lim.message_limit && typeof lim.message_limit === 'object' ? lim.message_limit : lim);
+    const q = { type: ml.type || null, rep: ml.representativeClaim || null,
+                overageInUse: !!ml.overageInUse, overageDisabledReason: ml.overageDisabledReason || null, windows: [] };
+    const W = ml.windows;
+    if (W && typeof W === 'object') {
+      for (const k in W) {
+        const w = W[k]; if (!w || typeof w !== 'object') continue;
+        const util = Number.isFinite(w.utilization) ? w.utilization : null;
+        q.windows.push({ name: k, status: w.status || null,
+          usedPct: util != null ? Math.round(util * 100) : null,
+          resetsInMs: Number.isFinite(w.resets_at) ? w.resets_at * 1000 - Date.now() : null });
+      }
+    } else if (ml.remaining != null) {                       // legacy flat shape
+      q.windows.push({ name: 'limit', leftN: ml.remaining, status: ml.type || null,
+        resetsInMs: Number.isFinite(ml.resetsAt) ? ml.resetsAt - Date.now() : null });
+    }
+    return (q.windows.length || q.type) ? q : null;
+  }
+  function fmtQuotaLine(q) {
+    if (!q) return null;
+    const parts = q.windows.map(w => {
+      const head = w.usedPct != null ? `${100 - w.usedPct}% left` : (w.leftN != null ? `${w.leftN} left` : (w.status || '?'));
+      const rs = (w.resetsInMs != null && w.resetsInMs > 0) ? ` (resets ${fmtDur(w.resetsInMs)})` : '';
+      return `${w.name} ${head}${rs}`;
+    });
+    let s = parts.join(' · ') || (q.type || '');
+    if (q.overageInUse) s += ' · OVERAGE ON';
+    else if (q.overageDisabledReason) s += ` · overage off (${q.overageDisabledReason})`;
+    return s;
+  }
+  function latestQuota() {   // most recent turn carrying a limit (error turns have none)
+    for (let i = turnLog.length - 1; i >= 0; i--) { const q = quotaSummary(turnLog[i].messageLimit); if (q) return q; }
+    return null;
+  }
 
   const fmtBytes = b =>
     b == null ? 'n/a'
@@ -410,20 +454,26 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     return total;
   }
 
-  // Output sizing from one decoded SSE event: count ONLY the generated text/JSON
-  // delta, never the event framing (type names, indices), which would otherwise be
-  // added on every delta and inflate the estimate.
-  function outputCharsFromEvent(obj, rawPayload) {
-    if (!obj) return rawPayload ? rawPayload.length : 0;   // unparseable: fall back
-    const d = obj.delta;
+  // Output sizing from one SSE event, split into ANSWER (visible text or tool-call
+  // JSON) vs THINKING (extended-reasoning / summary deltas). Metadata-only deltas
+  // (stop_reason, stop_sequence, message, display_content, ...) carry no content and
+  // return {} — framing is never counted. Returns { answer?, thinking? } char counts.
+  // Returns a SIGNED char count for one event: positive = visible answer (text /
+  // tool-call JSON), negative = thinking/summary, 0 = metadata/framing. A delta is a
+  // single type, so answer and thinking never co-occur in one event — the sign carries
+  // the split with zero per-event allocation.
+  function outputCharsFromEvent(obj) {
+    const d = obj && obj.delta;
     if (d) {
-      if (typeof d.text === 'string') return d.text.length;
-      if (typeof d.partial_json === 'string') return d.partial_json.length;
-      return extractStringChars(d);     // unknown delta shape: count delta leaves (skips top-level framing)
+      if (typeof d.text === 'string')         return d.text.length;
+      if (typeof d.partial_json === 'string') return d.partial_json.length;   // tool-call args
+      if (typeof d.thinking === 'string')     return -d.thinking.length;      // thinking
+      if (typeof d.summary === 'string')      return -d.summary.length;       // summarized reasoning
+      return 0;                                                               // metadata-only delta
     }
-    if (typeof obj.completion === 'string') return obj.completion.length;   // legacy shape
-    if (obj.content_block && typeof obj.content_block.text === 'string') return obj.content_block.text.length;
-    return 0;                                              // ping / framing-only event
+    if (typeof (obj && obj.completion) === 'string') return obj.completion.length;   // legacy shape
+    if (obj && obj.content_block && typeof obj.content_block.text === 'string') return obj.content_block.text.length;
+    return 0;                                                                 // ping / framing-only event
   }
 
   function isPingEvent(obj) { return !!(obj && obj.type === 'ping'); }
@@ -449,24 +499,38 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   function collectProbe(p, obj) {
     p.samples++;
     if (obj.type) p.types.add(obj.type);
+    if (obj.type === 'error') { p.sawError = true; p.errorType = (obj.error && (obj.error.type || obj.error.message)) || 'error'; }
     for (const k in obj) p.topKeys.add(k);
+    if (obj.type === 'message_limit') {
+      for (const k in obj) p.limitKeys.add(k);
+      if (obj.message_limit && typeof obj.message_limit === 'object')
+        for (const k in obj.message_limit) p.limitKeys.add('message_limit.' + k);
+    }
     const u = usageFromEvent(obj);
     if (u) for (const k in u) p.usageFields.add(k);
-    if (obj.delta && typeof obj.delta === 'object') {
-      for (const k in obj.delta) p.deltaKeys.add(k);
-      if (typeof obj.delta.text === 'string' || typeof obj.delta.partial_json === 'string') p.known = true;
+    const d = obj.delta;
+    if (d && typeof d === 'object') {
+      for (const k in d) p.deltaKeys.add(k);
+      if (typeof d.text === 'string' || typeof d.partial_json === 'string' ||
+          typeof d.thinking === 'string' || typeof d.summary === 'string') p.known = true;
+      else if (DELTA_META_KEYS.some(k => k in d)) { /* metadata-only delta: expected, not a content gap */ }
       else p.unknown = true;
     }
   }
 
   function reportProbe(r) {
-    const P = '✅', W = '⚠️', F = '❌';
+    const P = '✅', W = '⚠️', F = '❌', I = 'ℹ️';
+    const m = r.meta || {};
     const lines = [];
     if (r.reqParsedKeys && r.reqParsedKeys.length)
       lines.push(`${P} request body parsed (keys: ${r.reqParsedKeys.join(', ')}); ~${r.inChars} content chars` +
-        (r.attachments ? `; ${r.attachments} attachment(s) excluded from estimate (images = tiles, not chars)` : ''));
+        (r.inputApprox ? ' (approx — body over the scan cap)' : '') +
+        (r.attachments ? `; ${r.attachments} inlined blob(s) excluded (images = tiles, not chars)` : ''));
     else
       lines.push(`${W} request body NOT parsed as JSON — input estimate falls back to raw length`);
+    lines.push(`${I} input is NEW-TURN ONLY — claude.ai sends prior turns by reference (turn_message_uuids), not inlined, so this is not full-context input`);
+    if (m.model || m.thinkingMode != null || m.effort != null)
+      lines.push(`${I} model ${m.model || '?'}${m.thinkingMode != null ? ` · thinking_mode=${m.thinkingMode}` : ''}${m.effort != null ? ` · effort=${m.effort}` : ''} · tools ${m.toolCount || 0} · attachments ${m.attachmentCount || 0}`);
     lines.push(`${r.isCompletion ? P : W} endpoint "${r.endpoint}" ${r.isCompletion ? 'classified as a completion (counts as a message)' : 'NOT matched as a completion — check COMPLETION_RE if this was a chat turn'}`);
     lines.push(`${r.conv ? P : W} conversation id ${r.conv ? `parsed (${r.conv})` : 'NOT parsed from URL — convOf regex may be stale'}`);
     if (r.probe.usageFields.size) {
@@ -475,26 +539,30 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       lines.push(`${ok ? P : W} usage object present (fields: ${f.join(', ')}) → tokens are EXACT` +
         (ok ? '' : '; missing input_tokens/output_tokens — only partial exactness'));
     } else {
-      lines.push(`${W} no usage object in the stream → token figures are HEURISTIC (~chars/${charsPerToken().toFixed(2)})`);
+      lines.push(`${I} no usage object — EXPECTED on claude.ai (its internal stream omits usage); tokens are heuristic (~chars/${charsPerToken().toFixed(2)})` +
+        (r.probe.limitKeys && r.probe.limitKeys.size ? `. A message_limit event was seen (keys: ${[...r.probe.limitKeys].join(', ')}) — may carry quota/usage data.` : ''));
     }
-    if (r.probe.known && !r.probe.unknown)
-      lines.push(`${P} content deltas recognized (delta.text / partial_json) → output estimate is sound`);
+    if (r.probe.sawError)
+      lines.push(`${F} stream returned an ERROR event (${r.probe.errorType}) — the turn produced no content; this is a claude.ai error/limit response, NOT a parser problem`);
+    else if (r.probe.known && !r.probe.unknown)
+      lines.push(`${P} content deltas recognized (text / thinking / summary / partial_json) → output sizing is sound`);
     else if (r.probe.known && r.probe.unknown)
-      lines.push(`${W} mixed delta shapes — some recognized, some not (delta keys: ${[...r.probe.deltaKeys].join(', ')})`);
+      lines.push(`${W} a delta shape wasn't recognized as content (keys seen: ${[...r.probe.deltaKeys].join(', ')}) — verify outputCharsFromEvent()`);
     else if (r.probe.unknown)
-      lines.push(`${F} delta present but UNRECOGNIZED shape (keys: ${[...r.probe.deltaKeys].join(', ')}) → output estimate unreliable; update outputCharsFromEvent()`);
+      lines.push(`${F} delta present but UNRECOGNIZED (keys: ${[...r.probe.deltaKeys].join(', ')}) → output estimate unreliable; update outputCharsFromEvent()`);
     else
       lines.push(`${W} no content deltas seen this turn`);
+    if (r.probe.types.has('compaction_status')) lines.push(`${I} a compaction_status event was seen — claude.ai compacted this conversation's context mid-stream`);
     const problems = lines.filter(l => l.startsWith(F) || l.startsWith(W)).length;
+    const typesLine = `event types: ${[...r.probe.types].join(', ') || '(none)'}`;
+    const summary = problems ? `${W} ${problems} potential problem(s) flagged above.` : `${P} No problems — the parser matches the live shapes.`;
     console.group(`🔬 Schema probe — turn #${r.id} (${r.probe.samples} events sampled)`);
     for (const l of lines) console.log(l);
-    console.log(`event types seen: ${[...r.probe.types].join(', ') || '(none)'}`);
-    console.log(problems ? `${W} ${problems} potential problem(s) flagged above.` : `${P} No problems detected — the parser matches the live shapes.`);
+    console.log(typesLine);
+    console.log(summary);
     console.groupEnd();
-    const _status = lines.some(l => l.startsWith(F)) ? 'fail' : problems ? 'warn' : 'ok';
-    const _summary = problems ? `${W} ${problems} potential problem(s) flagged above.` : `${P} No problems detected — the parser matches the live shapes.`;
-    renderResultHud(`🔬 Schema probe — turn #${r.id} (${r.probe.samples} events)`, _status,
-      [...lines, `event types: ${[...r.probe.types].join(', ') || '(none)'}`, _summary]);
+    const status = lines.some(l => l.startsWith(F)) ? 'fail' : problems ? 'warn' : 'ok';
+    renderResultHud(`🔬 Schema probe — turn #${r.id} (${r.probe.samples} events)`, status, [...lines, typesLine, summary]);
     probeArmed = false;
   }
 
@@ -561,6 +629,22 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     } catch { return null; }
   }
 
+  // Pull useful per-turn metadata from claude.ai's request body (best-effort; the
+  // internal completion shape, confirmed via the schema probe: model, thinking_mode,
+  // effort, tools, attachments, files, sync_sources).
+  function requestMeta(obj) {
+    if (!obj || typeof obj !== 'object') return {};
+    const len = v => Array.isArray(v) ? v.length : 0;
+    return {
+      model: typeof obj.model === 'string' ? obj.model : null,
+      thinkingMode: obj.thinking_mode != null ? obj.thinking_mode : null,
+      effort: obj.effort != null ? obj.effort : null,
+      toolCount: len(obj.tools),
+      attachmentCount: len(obj.attachments) + len(obj.files),
+      syncSources: len(obj.sync_sources),
+    };
+  }
+
   // Size the outgoing request body and estimate its input tokens — CONTENT IS NOT
   // LOGGED, only measured. Handles string bodies AND the Request-object case
   // (fetch(new Request(...)) with the body on `input`, not `init`). The Request
@@ -580,12 +664,13 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       try { str = await input.clone().text(); } catch { str = null; }   // clone() runs sync, before the await
     }
     if (str != null) {
-      // Long threads carry the whole history each turn; over BODY_SCAN_MAX we skip the
-      // parse + per-leaf walk and approximate from length. Response usage overrides this.
+      // claude.ai references prior turns by UUID (turn_message_uuids), so the body holds
+      // only the NEW turn — inChars is new-turn input, NOT full context. Over BODY_SCAN_MAX
+      // we also skip the parse + per-leaf walk (and the full byte encode) and approximate.
       if (str.length > BODY_SCAN_MAX) {
         return {
-          reqBytes: byteLen(str), estInputTokens: estimateTokens(str.length),
-          inChars: str.length, attachments: 0, topKeys: [], approx: true,
+          reqBytes: str.length, estInputTokens: estimateTokens(str.length),
+          inChars: str.length, attachments: 0, topKeys: [], inputApprox: true, meta: {},
         };
       }
       const obj = tryParse(str);
@@ -595,9 +680,10 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
         reqBytes: byteLen(str), estInputTokens: estimateTokens(chars),
         inChars: chars, attachments: stats.attachments,
         topKeys: obj && typeof obj === 'object' ? Object.keys(obj) : [],
+        inputApprox: false, meta: requestMeta(obj),
       };
     }
-    return { reqBytes: bytes, estInputTokens: null, inChars: null, attachments: 0, topKeys: [] };
+    return { reqBytes: bytes, estInputTokens: null, inChars: null, attachments: 0, topKeys: [], inputApprox: false, meta: {} };
   }
 
   // ─── Recording ──────────────────────────────────────────────────────────────
@@ -635,6 +721,15 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     console.log('  request:           ', `${fmtBytes(entry.reqBytes)}  ${mark}${fmtTok(entry.inputTokens)} ${tokSrc}` +
       (entry.attachments ? `  +${entry.attachments} attachment(s) [not token-counted]` : ''));
     console.log('  response stream:   ', `${fmtBytes(entry.streamBytes)}  ${mark}${fmtTok(entry.outputTokens)} ${tokSrc}`);
+    if (entry.thinkingChars) console.log('  thinking / answer: ', `~${estimateTokens(entry.thinkingChars)} + ~${estimateTokens(entry.answerChars)} tok (heuristic split)`);
+    if (entry.thinkingShare != null) console.log('  thinking share:    ', `${Math.round(entry.thinkingShare * 100)}% of output was reasoning`);
+    if (entry.reasonedMs != null) console.log('  reasoned first:    ', `${entry.reasonedMs} ms thinking before the first answer token`);
+    if (entry.answerTokPerSec != null) console.log('  answer tok/s:      ', `${entry.answerTokPerSec} (answer-only, excludes thinking)`);
+    if (entry.streamError) console.log('  \u26a0 stream error:   ', entry.streamError);
+    if (entry.ttftText != null) console.log('  TTF-text:          ', fmtMs(entry.ttftText), '← first visible text (perceived latency)');
+    if (entry.stopReason) console.log('  stop reason:       ', entry.stopReason + (entry.stopDetails ? ` ${JSON.stringify(entry.stopDetails)}` : ''));
+    if (entry.model) console.log('  model / mode:      ', `${entry.model}${entry.thinkingMode != null ? ' · thinking=' + entry.thinkingMode : ''}${entry.effort != null ? ' · effort=' + entry.effort : ''} · tools ${entry.toolCount || 0} · att ${entry.attachmentCount || 0}`);
+    if (entry.messageLimit) { const _q = quotaSummary(entry.messageLimit); console.log('  message_limit:     ', _q ? fmtQuotaLine(_q) : entry.messageLimit); }
     if (entry.cacheRead != null || entry.cacheCreate != null) {
       const totalCtx = (entry.inputTokens || 0) + (entry.cacheRead || 0) + (entry.cacheCreate || 0);
       console.log('  cache tokens:      ', `read ${entry.cacheRead ?? 0} / create ${entry.cacheCreate ?? 0}  (total ctx ~${totalCtx})`);
@@ -738,9 +833,12 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   // ─── Rolling rates ──────────────────────────────────────────────────────────
   const RATE_WINDOWS = [['1m', 60000], ['5m', 300000], ['1h', 3600000], ['24h', 86400000]];
 
+  let ratesCacheKey = '', ratesCacheVal = null;
   function ratesSnapshot() {
     const now = Date.now();
-    return RATE_WINDOWS.map(([label, ms]) => {
+    const ck = turnLog.length + ':' + Math.floor(now / 1000);   // recompute at most ~1x/sec
+    if (ck === ratesCacheKey && ratesCacheVal) return ratesCacheVal;
+    const snap = RATE_WINDOWS.map(([label, ms]) => {
       const inWin = turnLog.filter(t => now - t.ts <= ms);
       const sum = key => inWin.reduce((a, t) => a + (Number.isFinite(t[key]) ? t[key] : 0), 0);
       return {
@@ -756,6 +854,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
         bytesDown: sum('streamBytes'),
       };
     });
+    ratesCacheKey = ck; ratesCacheVal = snap;
+    return snap;
   }
 
   function printRates() {
@@ -768,7 +868,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       completions: r.completions,
       'in tok': r.inTokens,
       'out tok': r.outTokens,
-      'total ctx': r.inTokens + r.cacheRead + r.cacheCreate,
+      'in+cache': r.inTokens + r.cacheRead + r.cacheCreate,
       'cache rd': r.cacheRead,
       'exact/total': `${r.exact}/${r.messages}`,
       up: fmtBytes(r.bytesUp),
@@ -778,7 +878,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     if (oneH) {
       console.log(`Projected at the last-hour rate: ~${oneH.completions * 24} completions/day, ` +
         `~${(oneH.inTokens + oneH.outTokens) * 24} fresh tok/day ` +
-        `(in/out are EXACT for ${oneH.exact}/${oneH.messages} turns, else ~chars/${charsPerToken().toFixed(2)}; "total ctx" adds cache reads).`);
+        `(in/out are EXACT for ${oneH.exact}/${oneH.messages} turns, else ~chars/${charsPerToken().toFixed(2)}; "in+cache" = new-turn input + cache, NOT full context on claude.ai).`);
     }
     console.groupEnd();
   }
@@ -854,6 +954,20 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     const errs = [...statusCounts.entries()].filter(([s]) => s >= 400);
     if (failCount || errs.length) { find.push(`\u26a0\ufe0f ${failCount} fetch failure(s)${errs.length ? `, statuses ${errs.map(([s, c]) => s + '\u00d7' + c).join(', ')}` : ''}`); rec.push('Errors/retries seen \u2014 check connectivity or rate limits (rateLimits()).'); }
 
+    const truncN = turnLog.filter(t => t.stopReason === 'max_tokens').length;
+    if (truncN) { find.push(`\u26a0\ufe0f ${truncN}/${n} turns hit max_tokens (output truncated)`); rec.push('Truncation: answers are being cut at the output cap \u2014 request continuation or narrow scope.'); }
+    if (streamErrorCount) find.push(`\u26a0\ufe0f ${streamErrorCount} stream error event(s) this session (claude.ai returned an error/limit mid-stream, HTTP 200)`);
+    const toolN = turnLog.filter(t => t.stopReason === 'tool_use').length;
+    if (toolN) find.push(`\u2139\ufe0f ${toolN}/${n} turns ended in tool_use (multi-step / agentic round-trips)`);
+    const _shares = turnLog.map(t => t.thinkingShare).filter(Number.isFinite);
+    if (_shares.length) { const _avg = _shares.reduce((a, b) => a + b, 0) / _shares.length; if (_avg >= 0.5) find.push(`\u2139\ufe0f reasoning averages ${Math.round(_avg * 100)}% of output (thinking-heavy)`); }
+    const q = latestQuota();
+    if (q) {
+      const hot = q.windows.filter(w => w.usedPct != null && w.usedPct >= 80);
+      if (hot.length) { hot.forEach(w => find.push(`⚠️ quota ${w.name} at ${w.usedPct}% used${w.resetsInMs > 0 ? ` (resets ${fmtDur(w.resetsInMs)})` : ''}`)); rec.push('Approaching a usage-window limit — pace requests or switch model until it resets.'); }
+      else find.push(`ℹ️ quota: ${fmtQuotaLine(q)}`);
+      if (q.overageDisabledReason) find.push(`ℹ️ overage disabled (${q.overageDisabledReason}) — requests are blocked at 100%, not billed past it`);
+    }
     const sm = window._claudeDebug.summary;
     if (sm.chatMs > 0) find.push(`\u2139\ufe0f chat span ${fmtDur(sm.chatMs)} \u2014 generated ${fmtDur(sm.engagedMs)} (${Math.round(100 * sm.engagedMs / sm.chatMs)}%), idle ${fmtDur(Math.max(0, sm.chatMs - sm.engagedMs))}`);
 
@@ -907,7 +1021,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
 
     let heartbeat = null;
     try {
-      const { reqBytes, estInputTokens, inChars, attachments, topKeys } = await bodyInfoP;
+      const { reqBytes, estInputTokens, inChars, attachments, topKeys, inputApprox, meta } = await bodyInfoP;
       const isCompletion = COMPLETION_RE.test(url);
 
       console.groupCollapsed(`[REQ #${id}] ${method} ${url}`);
@@ -957,10 +1071,14 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
         (async () => {
           let t1 = null;          // first network chunk
           let tEvt = null;        // first decoded content event
-          let reads = 0, events = 0, outChars = 0, streamBytes = 0;
+          let reads = 0, events = 0, answerChars = 0, thinkingChars = 0, streamBytes = 0;
+          let tFirstText = null, tFirstThink = null;   // first answer delta / first thinking delta
+          let stopReason = null, stopDetails = null, messageLimit = null, streamError = null, compaction = null;
           let recorded = false;
           let lastActivity = performance.now();
-          // Real usage from the stream, if it exposes a usage object (keyless, exact).
+          // Real usage from the stream IF present. NOTE: claude.ai's internal completion
+          // stream omits usage, so on claude.ai these stay null (heuristic is used); the
+          // public Anthropic API does send it.
           let realIn = null, realOut = null, cacheRead = null, cacheCreate = null;
           const noteUsage = u => {
             if (!u) return;
@@ -969,11 +1087,36 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
             if (Number.isFinite(u.cache_read_input_tokens)) cacheRead = u.cache_read_input_tokens;
             if (Number.isFinite(u.cache_creation_input_tokens)) cacheCreate = u.cache_creation_input_tokens;
           };
+          const noteLimit = o => {               // capture a claude.ai message_limit event
+            if (!o || typeof o !== 'object') return;
+            // the payload usually lives in a nested `message_limit` object (quota/reset);
+            // keep it whole when present, else fall back to top-level scalar fields.
+            if (o.message_limit && typeof o.message_limit === 'object') { messageLimit = o.message_limit; return; }
+            const out = {};
+            for (const k in o) { const v = o[k]; if (v == null || typeof v !== 'object') out[k] = v; }
+            messageLimit = out;
+          };
+          // One place to absorb an event: usage, stop reason, message_limit, content sizing.
+          const ingest = obj => {
+            const t = obj.type;
+            if (t !== 'content_block_delta') {   // usage/stop/limit/error never ride content deltas (the hot path)
+              noteUsage(usageFromEvent(obj));
+              const sr = (obj.delta && obj.delta.stop_reason) || obj.stop_reason;
+              if (sr) { stopReason = sr; stopDetails = (obj.delta && obj.delta.stop_details) || obj.stop_details || stopDetails; }
+              if (t === 'message_limit') noteLimit(obj);
+              if (t === 'error') streamError = obj.error || obj;   // claude.ai delivers errors as an SSE event (HTTP 200)
+              if (t === 'compaction_status') compaction = obj.compaction_status || obj;   // context-compaction signal
+            }
+            const n = outputCharsFromEvent(obj);   // signed: + answer, - thinking, 0 none
+            if (n > 0) answerChars += n;
+            else if (n < 0) thinkingChars -= n;
+            return n;                              // signed: caller derives first-answer vs first-thinking
+          };
           // Inter-event gaps (ms) for throughput jitter.
           const gaps = []; let lastEventTs = null;
           // Schema-probe accumulators (only when armed; latch so one turn consumes it).
           const probing = probeArmed; if (probing) probeArmed = false;
-          const probe = probing ? { topKeys: new Set(), deltaKeys: new Set(), types: new Set(), usageFields: new Set(), known: false, unknown: false, samples: 0 } : null;
+          const probe = probing ? { topKeys: new Set(), deltaKeys: new Set(), types: new Set(), usageFields: new Set(), limitKeys: new Set(), known: false, unknown: false, sawError: false, errorType: null, samples: 0 } : null;
           const reader = monitor.body.getReader();
           const decoder = new TextDecoder();
           let buf = '';
@@ -983,6 +1126,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
             recorded = true;
             clearInterval(watchdog);
             const streamDuration = t1 != null ? Math.round(t2 - t1) : null;
+            const outChars = answerChars + thinkingChars;
             const estOutputTokens = estimateTokens(outChars);
             // Prefer real usage from the stream when present; fall back to heuristic.
             const inputTokens  = realIn  != null ? realIn  : estInputTokens;
@@ -993,6 +1137,14 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
               calChars += inChars; calTokens += realIn;
             }
             const total = Math.round(t2 - t0);
+            const answerTok = estimateTokens(answerChars);
+            const thinkingShare = (answerChars + thinkingChars) > 0
+              ? +(thinkingChars / (answerChars + thinkingChars)).toFixed(2) : null;
+            const answerTokPerSec = (streamDuration && streamDuration > 0 && answerChars > 0)
+              ? Math.round(answerTok / (streamDuration / 1000)) : null;     // perceived (answer-only) rate
+            const reasonedMs = (tFirstText != null && tFirstThink != null)
+              ? Math.round(tFirstText - tFirstThink) : null;                // ms reasoning before first answer
+            if (streamError) streamErrorCount++;
             const tokPerSec = (streamDuration && streamDuration > 0 && outputTokens != null)
               ? Math.round(outputTokens / (streamDuration / 1000)) : null;   // steady (excl. TTFT)
             const tokPerSecWall = (total > 0 && outputTokens != null)
@@ -1011,11 +1163,19 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
               streamBytes, tokPerSec, tokPerSecWall,
               interEventP50: gapSorted.length ? Math.round(quantile(gapSorted, 0.5))  : null,
               interEventP95: gapSorted.length ? Math.round(quantile(gapSorted, 0.95)) : null,
+              answerChars, thinkingChars,
+              ttftText: tFirstText != null ? Math.round(tFirstText - t0) : null,
+              ttftThink: tFirstThink != null ? Math.round(tFirstThink - t0) : null,
+              reasonedMs, thinkingShare, answerTok, answerTokPerSec,
+              stopReason, stopDetails, messageLimit, streamError, compaction,
+              model: meta.model, thinkingMode: meta.thinkingMode, effort: meta.effort,
+              toolCount: meta.toolCount, attachmentCount: meta.attachmentCount, syncSources: meta.syncSources,
+              inputApprox,
               status,
             });
             if (probing) reportProbe({
               id, url, conv, endpoint: ep, isCompletion,
-              reqParsedKeys: topKeys, inChars, attachments, probe,
+              reqParsedKeys: topKeys, inChars, attachments, probe, meta, inputApprox,
             });
           };
 
@@ -1043,14 +1203,13 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
                     const obj = tryParse(payload);
                     if (obj && !isPingEvent(obj)) {   // skip truncated / unparseable trailing line
                       if (probe) collectProbe(probe, obj);
-                      noteUsage(usageFromEvent(obj));
-                      outChars += outputCharsFromEvent(obj, payload);
+                      ingest(obj);
                     }
                   }
                 }
                 if (!recorded) {
                   const haveReal = realIn != null || realOut != null;
-                  const outTok = realOut != null ? realOut : estimateTokens(outChars);
+                  const outTok = realOut != null ? realOut : estimateTokens(answerChars + thinkingChars);
                   console.log(`[SSE #${id}] closed cleanly — ${events} events, ${haveReal ? '' : '~'}${fmtTok(outTok)} out ${haveReal ? '(API)' : '(est)'}, ${((t2 - t0) / 1000).toFixed(2)}s`);
                 }
                 finish(response.status, t2);
@@ -1075,13 +1234,14 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
                     const obj = tryParse(payload);
                     if (probe && obj) collectProbe(probe, obj);
                     if (isPingEvent(obj)) continue;        // keep-alive, not content
-                    noteUsage(usageFromEvent(obj));
                     const now = performance.now();
                     if (tEvt == null) tEvt = now;
                     else gaps.push(now - lastEventTs);
                     lastEventTs = now;
                     events++;
-                    outChars += outputCharsFromEvent(obj, payload);
+                    const n = ingest(obj);
+                    if (n > 0 && tFirstText == null) tFirstText = now;
+                    else if (n < 0 && tFirstThink == null) tFirstThink = now;
                   }
                 }
                 if (from) buf = buf.slice(from);   // drop consumed prefix once per chunk
@@ -1227,6 +1387,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       'TTFT': t.ttft, 'TTFTev': t.ttftEvent, 'stream': t.streamDuration, 'total': t.total,
       'events': t.events, 'in': t.inputTokens, 'out': t.outputTokens,
       'cacheRd': t.cacheRead, 'src': t.tokensReal ? 'API' : '~',
+      'think': t.thinkingChars ? estimateTokens(t.thinkingChars) : 0,
+      'stop': t.stopReason || '', 'model': t.model || '',
       'tok/s': t.tokPerSec, 'gapP95': t.interEventP95,
     }))),
 
@@ -1257,7 +1419,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       turnLog.length = 0; wsLog.length = 0;
       firstTurnTs = lastTurnTs = null; engagedMs = 0;
       calChars = 0; calTokens = 0;
-      maxInFlight = 0; failCount = 0; statusCounts.clear(); lastRateLimit = null; slowP90 = null; slowP90At = 0;
+      maxInFlight = 0; failCount = 0; streamErrorCount = 0; statusCounts.clear(); lastRateLimit = null; slowP90 = null; slowP90At = 0;
       console.log('All counters cleared (turns, sockets, chat clocks, calibration, health). Session clock unchanged.');
     },
 
@@ -1266,6 +1428,48 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       navigator.clipboard.writeText(json)
         .then(() => console.log(`Copied ${turnLog.length} turns to clipboard.`))
         .catch(() => console.log(json));
+    },
+
+    // Compact, paste-ready snapshot for the `hud_audit` workflow: session summary +
+    // a slim per-turn array (incl. the new thinking/answer/stop/model fields). Copy
+    // it and paste to Claude with the keyword "hud_audit" to track trends over time.
+    audit: () => {
+      const s = window._claudeDebug.summary;
+      const data = turnLog.map(t => ({
+        id: t.id, ts: t.ts, conv: t.conv || null, model: t.model || null,
+        ttft: t.ttft, ttftText: t.ttftText ?? null, total: t.total, streamMs: t.streamDuration,
+        inTok: t.inputTokens, outTok: t.outputTokens,
+        thinkTok: t.thinkingChars ? estimateTokens(t.thinkingChars) : 0,
+        answerTok: t.answerChars ? estimateTokens(t.answerChars) : 0,
+        tokPerSec: t.tokPerSec, gapP95: t.interEventP95,
+        stop: t.stopReason || null, src: t.tokensReal ? 'API' : '~', status: t.status,
+      }));
+      const snapshot = {
+        tag: 'hud_audit', at: new Date().toISOString(),
+        sessionMs: s.sessionMs, chatMs: s.chatMs, engagedMs: s.engagedMs,
+        turns: s.turns, exactTurns: s.exactTurns, tokensTotal: s.tokensTotal,
+        medianTotalMs: s.medianTotalMs, p90TotalMs: s.p90TotalMs, medianTTFTMs: s.medianTTFTMs,
+        msgsLastHour: s.msgsLastHour, msgsLast24h: s.msgsLast24h,
+        charsPerToken: Number(charsPerToken().toFixed(2)),
+        quota: latestQuota(),
+        streamErrors: streamErrorCount,
+        data,
+      };
+      const json = JSON.stringify(snapshot, null, 2);
+      navigator.clipboard.writeText(json)
+        .then(() => console.log(`hud_audit snapshot copied (${data.length} turns) — paste to Claude with "hud_audit".`))
+        .catch(() => console.log(json));
+    },
+
+    help: () => {
+      const g = (t, items) => { console.group(t); items.forEach(i => console.log(i)); console.groupEnd(); };
+      console.group('%c\ud83d\udee0 _claudeDebug commands', 'font-weight:bold');
+      g('Reports', ['report() \u2014 summary + rates + histogram', 'rates() \u2014 1m/5m/1h/24h messages/tokens/bytes', 'byConversation() \u2014 per-conversation totals', 'turns() \u2014 per-turn table', 'stats() \u2014 TTFT/stream/total min/median/p90/max', 'health() \u2014 in-flight/fails/status', 'rateLimits() \u2014 last rate-limit headers']);
+      g('Visuals (on-page)', ['hud() \u2014 toggle overlay', 'histogramHud() \u2014 histogram panel (cycles metric)', 'histogram(metric?) \u2014 histogram to console']);
+      g('Diagnostics', ['probe() \u2014 arm schema probe (\ud83d\udd2c)', 'assess() \u2014 outliers & efficiency (\ud83d\udca1)', 'time() \u2014 session/chat/engaged/idle', 'calibration() \u2014 current chars/token', 'callers(on?) \u2014 toggle per-request caller capture']);
+      g('Data', ['data \u2014 turn array (getter)', 'summary \u2014 key metrics (getter)', 'export() \u2014 full turn JSON to clipboard', 'audit() \u2014 compact hud_audit snapshot (\ud83e\uddfe)', 'pending() \u2014 in-flight requests', 'sockets() \u2014 WebSocket activity']);
+      g('Control', ['reset() \u2014 clear turns + chat clocks', 'resetAll() \u2014 clear everything but session clock', 'stop() \u2014 restore fetch/WebSocket, remove overlays']);
+      console.groupEnd();
     },
 
     stop: () => {
@@ -1294,7 +1498,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
           + (Number.isFinite(t.outputTokens) ? t.outputTokens : 0), 0);
       const exactTurns = turnLog.filter(t => t.tokensReal).length;
       const now = Date.now();
-      const within = ms => turnLog.filter(t => now - t.ts <= ms).length;
+      const rs = ratesSnapshot();                       // shared (memoized) window buckets
+      const win = label => { const r = rs.find(x => x.window === label); return r ? r.messages : 0; };
       return {
         turns:         turnLog.length,
         inFlight:      pendingRequests.size,
@@ -1307,8 +1512,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
         sessionMs:     now - SESSION_START,
         chatMs:        (firstTurnTs != null && lastTurnTs != null) ? lastTurnTs - firstTurnTs : 0,
         engagedMs,
-        msgsLastHour:  within(3600000),
-        msgsLast24h:   within(86400000),
+        msgsLastHour:  win('1h'),
+        msgsLast24h:   win('24h'),
       };
     },
   };
@@ -1333,6 +1538,40 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     return b;
   }
 
+  // Drag `el` by `handle`. Clamps to the viewport, switches from right/bottom to
+  // left/top anchoring on first move, and sets handle.__dragged so a drag doesn't
+  // also fire the header's collapse-on-click. Calls onDrop({left,top}) when moved.
+  function makeDraggable(el, handle, onDrop) {
+    let sx = 0, sy = 0, ox = 0, oy = 0, active = false;
+    const onMove = (e) => {
+      if (!active) return;
+      let left = ox + (e.clientX - sx), top = oy + (e.clientY - sy);
+      left = Math.max(0, Math.min(left, window.innerWidth  - el.offsetWidth));
+      top  = Math.max(0, Math.min(top,  window.innerHeight - el.offsetHeight));
+      el.style.left = left + 'px'; el.style.top = top + 'px';
+      el.style.right = 'auto'; el.style.bottom = 'auto';
+      if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 4) handle.__dragged = true;
+    };
+    const onUp = () => {
+      if (!active) return;
+      active = false;
+      document.removeEventListener('pointermove', onMove, true);
+      document.removeEventListener('pointerup', onUp, true);
+      css(handle, { cursor: 'move' });
+      if (handle.__dragged && onDrop) onDrop({ left: parseInt(el.style.left, 10), top: parseInt(el.style.top, 10) });
+    };
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || (e.target && e.target.tagName === 'BUTTON')) return;   // left-drag only; let buttons click
+      handle.__dragged = false;
+      const r = el.getBoundingClientRect();
+      ox = r.left; oy = r.top; sx = e.clientX; sy = e.clientY; active = true;
+      css(handle, { cursor: 'grabbing' });
+      document.addEventListener('pointermove', onMove, true);
+      document.addEventListener('pointerup', onUp, true);
+      e.preventDefault();   // no text selection while dragging
+    });
+  }
+
   function ensureHud() {
     if (hudRoot) return;
     hudRoot = document.createElement('div');
@@ -1347,8 +1586,9 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     const header = document.createElement('div');
     css(header, {
       display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-      padding: '6px 8px', cursor: 'pointer', borderBottom: '1px solid rgba(108,71,255,0.4)',
+      padding: '6px 8px', cursor: 'move', borderBottom: '1px solid rgba(108,71,255,0.4)',
     });
+    header.title = 'Drag to move · click title to collapse';
     hudTitle = document.createElement('span');
     css(hudTitle, { fontWeight: 'bold', color: '#cdbcff' });
     const btns = document.createElement('span');
@@ -1360,11 +1600,12 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     btns.appendChild(mkBtn('🔬', 'Arm schema probe — analyzes the next turn and reports problems in the console', () => runSchemaProbe()));
     btns.appendChild(mkBtn('💡', 'Assess — outliers, efficiency & recommendations in the console', () => runAssessment()));
     btns.appendChild(mkBtn('⧉', 'Copy turn data as JSON', () => window._claudeDebug.export()));
+    btns.appendChild(mkBtn('🧾', 'Copy a hud_audit snapshot to the clipboard (then paste it to Claude)', () => window._claudeDebug.audit()));
     btns.appendChild(mkBtn('▾', 'Collapse / expand', () => setCollapsed(!hudCollapsed)));
     btns.appendChild(mkBtn('×', 'Hide overlay (re-show with _claudeDebug.hud())', () => toggleHud(false)));
     header.appendChild(hudTitle);
     header.appendChild(btns);
-    header.addEventListener('click', () => setCollapsed(!hudCollapsed));
+    header.addEventListener('click', () => { if (header.__dragged) { header.__dragged = false; return; } setCollapsed(!hudCollapsed); });
 
     hudBody = document.createElement('div');
     css(hudBody, { padding: '8px 8px 4px', whiteSpace: 'pre' });   // aligned rows: no wrap
@@ -1377,6 +1618,13 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     hudRoot.appendChild(hudBody);
     hudRoot.appendChild(hudFoot);
     (document.body || document.documentElement).appendChild(hudRoot);
+    if (hudPos == null) { try { const j = localStorage.getItem('claudeDebugHudPos'); if (j) hudPos = JSON.parse(j); } catch (e) {} }
+    if (hudPos && Number.isFinite(hudPos.left) && Number.isFinite(hudPos.top)) {
+      const L = Math.max(0, Math.min(hudPos.left, window.innerWidth  - hudRoot.offsetWidth));
+      const T = Math.max(0, Math.min(hudPos.top,  window.innerHeight - hudRoot.offsetHeight));
+      css(hudRoot, { left: L + 'px', top: T + 'px', right: 'auto', bottom: 'auto' });
+    }
+    makeDraggable(hudRoot, header, (pos) => { hudPos = pos; try { localStorage.setItem('claudeDebugHudPos', JSON.stringify(pos)); } catch (e) {} });
     setCollapsed(hudCollapsed);
   }
 
@@ -1405,6 +1653,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     const oneH = ratesSnapshot().find(r => r.window === '1h') || { messages: 0, inTokens: 0, outTokens: 0 };
     hudTitle.textContent = 'Claude Debug';
     const oneHTok = oneH.inTokens + oneH.outTokens;
+    const _q = latestQuota();
+    const quotaLine = _q ? `quota        ${fmtQuotaLine(_q)}` : null;
     hudBody.textContent = [
       `turns        ${s.turns}   (in-flight ${s.inFlight})`,
       `time         session ${fmtDur(s.sessionMs)} · chat ${fmtDur(s.chatMs)}`,
@@ -1414,6 +1664,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       `tokens       ${s.turns && s.exactTurns === s.turns ? '' : '~'}${s.tokensTotal}  (in+out; ${s.exactTurns}/${s.turns} exact)`,
       `last 1h      ${oneH.messages} msgs · ~${oneHTok} tok`,
       `last 24h     ${s.msgsLast24h} msgs`,
+      ...(quotaLine ? [quotaLine] : []),
       `~ / day      ~${oneH.messages * 24} msgs · ~${oneHTok * 24} tok`,
     ].join('\n');
     hudFoot.textContent = `~ = est (chars/${charsPerToken().toFixed(2)}); no ~ = exact from stream`;
@@ -1449,26 +1700,35 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     info: { bd: '#6c47ff', bg: 'rgba(108,71,255,0.18)', tag: ''      },
   };
 
-  function ensureResultHud() {
-    if (resultRoot) return;
-    resultRoot = document.createElement('div');
-    css(resultRoot, {
-      position: 'fixed', left: '12px', top: '80px', zIndex: '2147483647',
+  // Shared scaffold for the on-page side panels: a fixed, dark, rounded box with a
+  // flex header (title + buttons) and a body. Callers add panel-specific styling
+  // and the close button, keeping the two panels visually consistent.
+  function makePanel(side) {
+    const root = document.createElement('div');
+    css(root, {
+      position: 'fixed', [side]: '12px', top: '80px', zIndex: '2147483647',
       font: '12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace', color: '#fff',
       background: 'rgba(20,16,38,0.96)', border: '1px solid #6c47ff', borderRadius: '8px',
-      boxShadow: '0 4px 16px rgba(0,0,0,0.4)', maxWidth: '420px', maxHeight: '70vh',
-      overflow: 'auto', backdropFilter: 'blur(2px)',
+      boxShadow: '0 4px 16px rgba(0,0,0,0.4)', backdropFilter: 'blur(2px)',
     });
-    resultHead = document.createElement('div');
-    css(resultHead, { display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-      gap: '8px', padding: '6px 10px', fontWeight: 'bold', borderBottom: '1px solid rgba(108,71,255,0.4)' });
-    resultTitle = document.createElement('span');
-    resultHead.appendChild(resultTitle);
-    resultHead.appendChild(mkBtn('×', 'Close', () => destroyResultHud()));
-    resultBody = document.createElement('div');
+    const head = document.createElement('div');
+    css(head, { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' });
+    const title = document.createElement('span');
+    const body = document.createElement('div');
+    head.appendChild(title);
+    root.appendChild(head);
+    root.appendChild(body);
+    return { root, head, title, body };
+  }
+
+  function ensureResultHud() {
+    if (resultRoot) return;
+    const p = makePanel('left');
+    resultRoot = p.root; resultHead = p.head; resultTitle = p.title; resultBody = p.body;
+    css(resultRoot, { maxWidth: '420px', maxHeight: '70vh', overflow: 'auto' });
+    css(resultHead, { padding: '6px 10px', fontWeight: 'bold', borderBottom: '1px solid rgba(108,71,255,0.4)' });
     css(resultBody, { padding: '4px 0' });
-    resultRoot.appendChild(resultHead);
-    resultRoot.appendChild(resultBody);
+    resultHead.appendChild(mkBtn('×', 'Close', () => destroyResultHud()));
     (document.body || document.documentElement).appendChild(resultRoot);
   }
 
@@ -1498,23 +1758,12 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
 
   function ensureHistHud() {
     if (histRoot) return;
-    histRoot = document.createElement('div');
-    css(histRoot, {
-      position: 'fixed', right: '12px', zIndex: '2147483647',
-      font: '12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace', color: '#fff',
-      background: 'rgba(20,16,38,0.96)', border: '1px solid #6c47ff', borderRadius: '8px',
-      boxShadow: '0 4px 16px rgba(0,0,0,0.4)', maxWidth: '340px', padding: '8px',
-      backdropFilter: 'blur(2px)', userSelect: 'none',
-    });
-    const head = document.createElement('div');
-    css(head, { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' });
-    histTitle = document.createElement('span');
+    const p = makePanel('right');
+    histRoot = p.root; histTitle = p.title; histBody = p.body;
+    css(histRoot, { maxWidth: '340px', padding: '8px', userSelect: 'none' });
+    css(p.head, { marginBottom: '6px' });
     css(histTitle, { fontWeight: 'bold', color: '#cdbcff' });
-    head.appendChild(histTitle);
-    head.appendChild(mkBtn('×', 'Close histogram', () => destroyHistHud()));
-    histBody = document.createElement('div');
-    histRoot.appendChild(head);
-    histRoot.appendChild(histBody);
+    p.head.appendChild(mkBtn('×', 'Close histogram', () => destroyHistHud()));
     (document.body || document.documentElement).appendChild(histRoot);
   }
 
@@ -1579,6 +1828,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   console.log('  _claudeDebug.probe()    — arm a schema probe; next turn is analyzed for parser/shape problems (also the 🔬 HUD button)');
   console.log('  _claudeDebug.assess()   — outliers, efficiency & recommendations · _claudeDebug.time() — session/chat/engaged time');
   console.log('  _claudeDebug.byConversation(), .sockets(), .health(), .rateLimits(), .histogramHud(), .calibration(), .stats(), .pending(), .export(), .stop()');
+  console.log('  _claudeDebug.help()     \u2014 grouped list of every command');
   console.log('%c Live-Expression-safe (👁 button, no parens): _claudeDebug.summary / _claudeDebug.data ', 'color:#6c47ff;font-weight:bold');
   console.log('  Tokens come from the stream usage object when present (exact); otherwise heuristic ~chars/3.6. No API key used.');
 })();

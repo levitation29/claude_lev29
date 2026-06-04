@@ -189,3 +189,8 @@ echo "🔢 Turn $turns · tool calls so far: $tools"
 
 **xyzzy** touch_start ; session_time_header ; session_counts ; session_counts_header ;
 Since you told me you have structural problems in following those requirements, remember to not do your default action, which is, write text first, then remember the tool call. Tool call must be literally the first thing in your response, no text before it. 
+
+
+
+## specific to the claude_browser_extension.sh hud data. copy/paste from hud with this command
+**hud_audit** — I've pasted a _claudeDebug.audit() snapshot. Append it to the in-conversation audit ledger as the next numbered entry, then assess the latest entry against all prior entries: trends in TTFT, total time, throughput (tok/s), output size, thinking-vs-answer share, stop reasons, and any error/limit signals; call out drift and outliers. Correlations, not proof. History is per-conversation unless memory is enabled.
