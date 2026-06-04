@@ -196,24 +196,39 @@ down both overlays.
   (session-relative assessment thresholds: `slowVsMedian`, `ttftSpike`,
   `inOutRatio`, `ctxGrowth`, `cacheHitLow`, `tpsDip`).
 - **State:** `origFetch`, `origWebSocket`, `pendingRequests` (Map),
-  `turnLog` (array), `wsLog` (array), `reqCounter`, a shared `TextEncoder`;
+  `turnLog` (array), `wsLog` (array), `reqCounter` (absolute id stamped on every
+  monitored `/api/` request — background calls included, so it outpaces message
+  count), `completionCounter` (session count of completion turns; the probe reports
+  both), `endpointCounts` (Map of `endpointKey` → count, the source for
+  `endpoints()`; like the counters above it persists across `reset()`), a shared `TextEncoder`;
   health: `maxInFlight`, `failCount`, `statusCounts` (Map), `lastRateLimit`;
   calibration: `calChars`/`calTokens` (running totals over real-usage turns);
   schema probe: `probeArmed`; time: `SESSION_START`, `firstTurnTs`, `lastTurnTs`,
   `engagedMs`; HUD: `hudRoot/hudTitle/hudBody/hudInterval/hudCollapsed`,
-  `hudHistIdx`, and the histogram panel `histRoot/histTitle/histBody`.
+  `hudHistIdx`, drag position `hudPos` (persisted to `localStorage` under
+  `claudeDebugHudPos`), the histogram panel `histRoot/histTitle/histBody`, and the
+  shared result panel `resultRoot/resultHead/resultTitle/resultBody`.
 - **Helper functions (the contracts you'd rebuild):** `fmtMs/fmtDur/fmtBytes/fmtTok`,
-  `estimateTokens`, `byteLen`, `tryParse`, `looksLikeBase64Blob`,
+  `estimateTokens`, `byteLen`, `tryParse`, `copyJson` (clipboard-or-log JSON, shared
+  by `export`/`audit`), the turn-log column helpers `col`/`median`/`sumBy`, the
+  `ICON` status-glyph table (one source of truth for ✅/⚠️/❌/ℹ️ across the probe and
+  assessment), `looksLikeBase64Blob`,
   `extractStringChars` (base64-skipping string-leaf sum), `outputCharsFromEvent`
-  (text-only output sizing), `isPingEvent`, `usageFromEvent`, `parseServerTiming`,
-  `captureRateLimit`, `callerStack`, `isMonitoredHost/isMonitoredApi/pathOf/convOf`,
+  (signed per-event char sizing: + answer, − thinking, 0 framing), `isPingEvent`,
+  `usageFromEvent`, `parseServerTiming`,
+  `captureRateLimit`, `callerStack`, `isMonitoredHost/isMonitoredApi/pathOf/convOf/endpointKey`,
   `analyzeBody` (async), `recordTurn`, `quantile/calcStats`,
   `histogramData` (shared compute) + `printHistogram` (console renderer),
   `ratesSnapshot/printRates`, `byConversation`, `runAssessment` (outliers +
-  efficiency), schema probe: `runSchemaProbe/collectProbe/reportProbe`, HUD:
-  `css/mkBtn/ensureHud/setCollapsed/updateHud/toggleHud/destroyHud/whenBody`,
-  histogram panel: `ensureHistHud/destroyHistHud/renderHistHud`; shared result
-  panel for probe/assess verdicts: `ensureResultHud/destroyResultHud/renderResultHud`.
+  efficiency; builds its verdict lines once and renders them to both the console and
+  the result panel), schema probe: `runSchemaProbe/collectProbe/reportProbe`, HUD:
+  `css/mkBtn/makeDraggable/ensureHud/setCollapsed/updateHud/toggleHud/destroyHud/whenBody`;
+  `makePanel(side)` is the shared scaffold for the side panels and wires
+  `makeDraggable` into every panel it builds, so **all overlays are drag-by-header**,
+  not just the main HUD; histogram panel: `ensureHistHud/destroyHistHud/renderHistHud`
+  (`ensureHistHud` positions the panel once, below the main HUD, so a later drag
+  sticks); shared result panel for probe/assess verdicts:
+  `ensureResultHud/destroyResultHud/renderResultHud`.
 - **Turn record:** `{ id, conv, url, endpoint, isCompletion, ts, t0, t1, t2, ttft,
   ttftEvent, streamDuration, total, reads, events, reqBytes, inChars, attachments,
   estInputTokens, estOutputTokens, inputTokens, outputTokens, tokensReal,
@@ -287,6 +302,20 @@ isn't public. The monitor therefore has **two sources**, in priority order:
 - **Per-turn metadata is captured from the body:** `model`, `thinking_mode`,
   `effort`, and counts of `tools` / `attachments` / `files` — so turns can be read
   by model and mode. `stop_reason` (+ `stop_details`) is captured from `message_delta`.
+- **Last probe-confirmed (turn #73, PASS — parser matches live shapes).** Observed
+  completion request-body keys: `prompt`, `parent_message_uuid`, `timezone`,
+  `personalized_styles`, `locale`, `model`, `effort`, `thinking_mode`, `tools`,
+  `turn_message_uuids`, `attachments`, `files`, `sync_sources`, `rendering_mode`
+  (only `model`/`thinking_mode`/`effort`/`tools`/`attachments`/`files`/`sync_sources`
+  are read; the rest are ignored framing). Live model `claude-opus-4-8`,
+  `thinking_mode=auto`, `effort=high`. Observed `message_limit` keys: `type`,
+  `message_limit`, and nested `message_limit.{type, resetsAt, remaining,
+  perModelLimit, representativeClaim, overageDisabledReason, overageInUse, windows}`
+  — `windows` present and driving the quota line; `perModelLimit` is present but
+  **not parsed** (windows is the source of truth, so it's left alone to avoid
+  speculative misreporting). Event types seen: `message_start`, `content_block_start`,
+  `content_block_delta`, `content_block_stop`, `message_delta`, `message_limit`,
+  `message_stop`. No `usage` object (expected on claude.ai) → tokens heuristic.
 - **In-stream errors are captured.** claude.ai delivers failures as an `error` SSE
   event over an HTTP 200 response (e.g. `overloaded_error`, rate/limit). The monitor
   records it on the turn as `streamError`, counts it (`streamErrorCount`), and the
@@ -321,6 +350,9 @@ Toggle from code with `_claudeDebug.hud()` / `hud(true)` / `hud(false)`.
 and drag to reposition the panel. It clamps to the viewport and the position is
 remembered across reloads (best-effort `localStorage`, key `claudeDebugHudPos`). A
 drag won't trigger the collapse-on-click; clear the key to reset to top-right.
+The result and histogram panels below are **also draggable by their headers** (same
+`makeDraggable` helper, wired in via the shared `makePanel` scaffold); unlike the
+main HUD they don't persist position, since they're transient and closeable.
 
 The **🔬 probe** and **💡 assess** buttons render their verdicts into a
 color-coded on-page panel on the left edge (green PASS / amber CHECK / red FAIL),
@@ -332,7 +364,9 @@ The **📊 button** opens a *second* panel that renders the histogram as DOM bar
 on click (no per-second redraw) and **cycles the metric** on repeated clicks
 through `HUD_HIST_METRICS` (total → ttft → ttftEvent → streamDuration →
 outputTokens → inputTokens → tokPerSec → interEventP95 → reqBytes → streamBytes →
-wrap). The panel has its own ×; closing the main HUD or `stop()` tears it down too.
+wrap). It positions itself below the main HUD **once, at creation** (in
+`ensureHistHud`), so cycling the metric never yanks it back after you've dragged it.
+The panel has its own ×; closing the main HUD or `stop()` tears it down too.
 Both overlays are built with `document.createElement` + `el.style.*` only.
 
 ### 4.2 Token caching in a long conversation (and its effect on the HUD)
@@ -483,6 +517,13 @@ It analyzes one turn then disarms. The fastest way to detect — and fix — a
 claude.ai shape change that would otherwise silently degrade the token figures.
 The probe (and assess) verdicts also render in the on-page panel, color-coded.
 
+The verdict header reports **two numbers**: `completion #N · request #id`. `N`
+(`completionCounter`) counts completion turns this session; `id` (`reqCounter`) is
+the absolute sequence number of *every* monitored `/api/` request — completions,
+plus the app's background polling / metadata / limit calls — so `id` runs well
+ahead of `N`. A non-completion SSE turn (rare) shows only `request #id`. Neither
+counter is cleared by `reset()`/`resetAll()`; both reset only on a full reload.
+
 ### 4.5 Session time vs chat time (and engaged / idle)
 The HUD tracks three distinct clocks, all in JS, all separate from any
 assistant-side timer:
@@ -553,6 +594,7 @@ Call with parentheses:
 | `_claudeDebug.histogramHud(metric?)` | open the DOM histogram panel for a metric |
 | `_claudeDebug.rates()` | rolling streams/completions/tokens (in/out/total-ctx/cache)/bytes over 1m/5m/1h/24h + daily projection, with an exact/total column |
 | `_claudeDebug.byConversation()` | per-conversation message/token totals |
+| `_claudeDebug.endpoints()` | per-endpoint request tally over **all** monitored `/api/` calls (not just completions), sorted by count with a % column. Keyed by last path segment, with id-like tails folded to `<parent>/:id` (via `endpointKey`) so conversation/message ids don't each get a row. The gap between this total and completion count is the app's background traffic |
 | `_claudeDebug.health()` | peak in-flight, current in-flight, fetch failures, HTTP status mix, last rate-limit |
 | `_claudeDebug.rateLimits()` | most recent rate-limit headers seen |
 | `_claudeDebug.probe()` | arm a schema probe; the next streamed turn is analyzed for parser/shape problems |

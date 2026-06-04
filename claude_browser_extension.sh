@@ -232,6 +232,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
 //   _claudeDebug.turns()     — table of every completed turn
 //   _claudeDebug.rates()     — rolling messages/tokens/bytes over 1m/5m/1h/24h
 //   _claudeDebug.byConversation() — per-conversation totals
+//   _claudeDebug.endpoints()     — per-endpoint request tally (all monitored /api/ calls)
 //   _claudeDebug.sockets()   — WebSocket activity summary
 //   _claudeDebug.report()    — readable summary + rates + histogram
 //   _claudeDebug.reset()     — clear turn log
@@ -324,6 +325,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   const turnLog = [];   // see record shape in recordTurn()
   const wsLog = [];     // { url, opened, closed, sent, recv }
   let reqCounter = 0;
+  let completionCounter = 0;   // session count of completion turns (the "message #" the probe reports alongside the absolute request id)
+  const endpointCounts = new Map();   // normalized endpoint key -> count, over every monitored request (see endpointKey / endpoints())
   const encoder = new TextEncoder();
 
   // Health / capacity tracking (keyless, exact).
@@ -424,6 +427,25 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
 
   const tryParse = s => { try { return JSON.parse(s); } catch { return null; } };
 
+  // Copy a value to the clipboard as pretty JSON; on failure (tab unfocused, no
+  // permission) fall back to logging it so it can still be copied by hand.
+  const copyJson = (value, okMsg) => {
+    const json = JSON.stringify(value, null, 2);
+    navigator.clipboard.writeText(json)
+      .then(() => console.log(okMsg))
+      .catch(() => console.log(json));
+  };
+
+  // Turn-log column helpers (used across stats/summary/assessment/rates).
+  // col(key): finite values of one field across all turns. median(): linear-
+  // interpolation median of a value list. sumBy(): summed finite field over a set.
+  const col    = key => turnLog.map(t => t[key]).filter(Number.isFinite);
+  const median = vals => { const a = [...vals].filter(Number.isFinite).sort((x, y) => x - y); return a.length ? quantile(a, 0.5) : null; };
+  const sumBy  = (arr, key) => arr.reduce((a, t) => a + (Number.isFinite(t[key]) ? t[key] : 0), 0);
+
+  // Status icons — one source of truth for the probe/assessment verdicts.
+  const ICON = { pass: '✅', warn: '⚠️', fail: '❌', info: 'ℹ️' };
+
   // Detect base64/data-URI blobs (image & file attachments). Counting these as
   // chars/token wildly overstates input — Claude tokenizes images by tiles, not by
   // base64 length — so we EXCLUDE them from the char estimate (their real bytes
@@ -454,14 +476,11 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     return total;
   }
 
-  // Output sizing from one SSE event, split into ANSWER (visible text or tool-call
-  // JSON) vs THINKING (extended-reasoning / summary deltas). Metadata-only deltas
-  // (stop_reason, stop_sequence, message, display_content, ...) carry no content and
-  // return {} — framing is never counted. Returns { answer?, thinking? } char counts.
-  // Returns a SIGNED char count for one event: positive = visible answer (text /
-  // tool-call JSON), negative = thinking/summary, 0 = metadata/framing. A delta is a
-  // single type, so answer and thinking never co-occur in one event — the sign carries
-  // the split with zero per-event allocation.
+  // Output sizing from one SSE event. Returns a SIGNED char count: positive =
+  // visible answer (text / tool-call JSON), negative = thinking/summary, 0 =
+  // metadata/framing (stop_reason, message, display_content, ping, ...). A delta is
+  // a single type, so answer and thinking never co-occur in one event — the sign
+  // carries the split with zero per-event allocation.
   function outputCharsFromEvent(obj) {
     const d = obj && obj.delta;
     if (d) {
@@ -519,7 +538,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   }
 
   function reportProbe(r) {
-    const P = '✅', W = '⚠️', F = '❌', I = 'ℹ️';
+    const P = ICON.pass, W = ICON.warn, F = ICON.fail, I = ICON.info;
     const m = r.meta || {};
     const lines = [];
     if (r.reqParsedKeys && r.reqParsedKeys.length)
@@ -556,13 +575,16 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     const problems = lines.filter(l => l.startsWith(F) || l.startsWith(W)).length;
     const typesLine = `event types: ${[...r.probe.types].join(', ') || '(none)'}`;
     const summary = problems ? `${W} ${problems} potential problem(s) flagged above.` : `${P} No problems — the parser matches the live shapes.`;
-    console.group(`🔬 Schema probe — turn #${r.id} (${r.probe.samples} events sampled)`);
+    // "completion #N · request #id" when this was a completion; just the request id otherwise.
+    // N counts completions this session; the request id counts every monitored /api/ call.
+    const label = r.completionSeq != null ? `completion #${r.completionSeq} · request #${r.id}` : `request #${r.id}`;
+    console.group(`🔬 Schema probe — ${label} (${r.probe.samples} events sampled)`);
     for (const l of lines) console.log(l);
     console.log(typesLine);
     console.log(summary);
     console.groupEnd();
     const status = lines.some(l => l.startsWith(F)) ? 'fail' : problems ? 'warn' : 'ok';
-    renderResultHud(`🔬 Schema probe — turn #${r.id} (${r.probe.samples} events)`, status, [...lines, typesLine, summary]);
+    renderResultHud(`🔬 Schema probe — ${label} (${r.probe.samples} events)`, status, [...lines, typesLine, summary]);
     probeArmed = false;
   }
 
@@ -627,6 +649,17 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       const m = new URL(rawUrl, location.href).pathname.match(/chat_conversations\/([0-9a-f-]{8,})/i);
       return m ? m[1].slice(0, 8) : null;
     } catch { return null; }
+  }
+
+  // Group key for the per-endpoint tally: the last path segment, but if that segment
+  // is id-like (uuid / hex / all-digits) it's folded to "<parent>/:id" so every
+  // conversation/message id doesn't become its own row. Query string is ignored.
+  function endpointKey(rawUrl) {
+    const segs = pathOf(rawUrl).split('/').filter(Boolean);
+    if (!segs.length) return '/';
+    const last = segs[segs.length - 1];
+    const idish = /^[0-9a-f-]{8,}$/i.test(last) || /^\d+$/.test(last);
+    return (idish && segs.length >= 2) ? `${segs[segs.length - 2]}/:id` : last;
   }
 
   // Pull useful per-turn metadata from claude.ai's request body (best-effort; the
@@ -770,13 +803,12 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     if (!turnLog.length) { console.log('No turns recorded yet.'); return; }
     const fmtRow = s => !s ? 'n/a'
       : `min ${fmtMs(s.min)} / med ${fmtMs(s.median)} / p90 ${fmtMs(s.p90)} / max ${fmtMs(s.max)} (n=${s.n})`;
-    const finite = key => turnLog.map(t => t[key]).filter(Number.isFinite);
 
     console.group('📊 Turn latency summary');
-    console.log('  TTFT (chunk):      ', fmtRow(calcStats(finite('ttft'))));
-    console.log('  TTFT (event):      ', fmtRow(calcStats(finite('ttftEvent'))));
-    console.log('  Streaming duration:', fmtRow(calcStats(finite('streamDuration'))));
-    console.log('  Total turn time:   ', fmtRow(calcStats(finite('total'))));
+    console.log('  TTFT (chunk):      ', fmtRow(calcStats(col('ttft'))));
+    console.log('  TTFT (event):      ', fmtRow(calcStats(col('ttftEvent'))));
+    console.log('  Streaming duration:', fmtRow(calcStats(col('streamDuration'))));
+    console.log('  Total turn time:   ', fmtRow(calcStats(col('total'))));
     console.groupEnd();
   }
 
@@ -802,7 +834,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   function histogramData(metric = 'total', buckets = 5) {
     const fmt = fmtForMetric(metric);
     const label = METRIC_LABEL[metric] ?? metric;
-    const values = turnLog.map(t => t[metric]).filter(v => Number.isFinite(v) && v >= 0);
+    const values = col(metric).filter(v => v >= 0);
     if (values.length < 2) return { metric, label, n: values.length, note: 'Not enough data (need 2+ turns).' };
     const min = Math.min(...values), max = Math.max(...values);
     if (max === min) return { metric, label, n: values.length, single: fmt(min) };
@@ -840,7 +872,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     if (ck === ratesCacheKey && ratesCacheVal) return ratesCacheVal;
     const snap = RATE_WINDOWS.map(([label, ms]) => {
       const inWin = turnLog.filter(t => now - t.ts <= ms);
-      const sum = key => inWin.reduce((a, t) => a + (Number.isFinite(t[key]) ? t[key] : 0), 0);
+      const sum = key => sumBy(inWin, key);
       return {
         window: label,
         messages: inWin.length,
@@ -901,10 +933,9 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   // ─── Assessment: outliers + efficiency, relative to THIS session ────────────
   function runAssessment() {
     const n = turnLog.length;
-    if (n < 3) { console.log(`Need \u22653 completed turns to assess (have ${n}).`); renderResultHud('💡 Assessment', 'info', ['Need at least 3 completed turns before assessing (have ' + n + ').']); return; }
-    const med = arr => { const a = arr.filter(Number.isFinite).sort((x, y) => x - y); return a.length ? quantile(a, 0.5) : null; };
-    const totals = turnLog.map(t => t.total).filter(Number.isFinite);
-    const sT = calcStats(totals), sTtft = calcStats(turnLog.map(t => t.ttft).filter(Number.isFinite));
+    if (n < 3) { console.log(`Need ≥3 completed turns to assess (have ${n}).`); renderResultHud('💡 Assessment', 'info', ['Need at least 3 completed turns before assessing (have ' + n + ').']); return; }
+    const totals = col('total');
+    const sT = calcStats(totals), sTtft = calcStats(col('ttft'));
     const medTotal = sT.median, p90Total = sT.p90;
     const find = [], rec = [];
 
@@ -912,81 +943,78 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       .sort((a, b) => b.total - a.total).slice(0, 3);
     for (const t of slow) {
       const cause = (Number.isFinite(t.ttft) && t.ttft > 0.5 * t.total) ? 'server/network latency (TTFT-dominated)' : 'long output (streaming-dominated)';
-      find.push(`\u26a0\ufe0f turn #${t.id}: ${(t.total / medTotal).toFixed(1)}\u00d7 your median (${fmtMs(t.total)}) \u2014 ${cause}`);
+      find.push(`${ICON.warn} turn #${t.id}: ${(t.total / medTotal).toFixed(1)}× your median (${fmtMs(t.total)}) — ${cause}`);
     }
-    if (!slow.length) find.push(`\u2705 latency consistent \u2014 no turn beat ${ASSESS.slowVsMedian}\u00d7 median & p90`);
+    if (!slow.length) find.push(`${ICON.pass} latency consistent — no turn beat ${ASSESS.slowVsMedian}× median & p90`);
 
     if (sTtft && sTtft.median > 0 && sTtft.p90 > ASSESS.ttftSpike * sTtft.median)
-      find.push(`\u26a0\ufe0f TTFT spiky: p90 ${fmtMs(sTtft.p90)} vs median ${fmtMs(sTtft.median)} \u2014 intermittent server slowness`);
+      find.push(`${ICON.warn} TTFT spiky: p90 ${fmtMs(sTtft.p90)} vs median ${fmtMs(sTtft.median)} — intermittent server slowness`);
 
-    const medIn = med(turnLog.map(t => t.inputTokens)), medOut = med(turnLog.map(t => t.outputTokens));
+    const medIn = median(col('inputTokens')), medOut = median(col('outputTokens'));
     if (medIn != null && medOut) {
       const ratio = medIn / medOut;
-      if (ratio > ASSESS.inOutRatio) { find.push(`\u26a0\ufe0f input:output \u2248 ${ratio.toFixed(0)}:1 \u2014 lots of context per unit of answer`); rec.push('High input:output \u2014 if answers are short, a fresh chat or trimming pasted context cuts latency/cost.'); }
-      else find.push(`\u2705 input:output \u2248 ${ratio.toFixed(1)}:1 \u2014 reasonable`);
+      if (ratio > ASSESS.inOutRatio) { find.push(`${ICON.warn} input:output ≈ ${ratio.toFixed(0)}:1 — lots of context per unit of answer`); rec.push('High input:output — if answers are short, a fresh chat or trimming pasted context cuts latency/cost.'); }
+      else find.push(`${ICON.pass} input:output ≈ ${ratio.toFixed(1)}:1 — reasonable`);
     }
 
-    const ins = turnLog.map(t => t.inputTokens).filter(Number.isFinite);
+    const ins = col('inputTokens');
     if (ins.length >= 4 && ins[0] > 0 && ins[ins.length - 1] / ins[0] > ASSESS.ctxGrowth) {
       const g = (ins[ins.length - 1] / ins[0]).toFixed(1);
-      find.push(`\u26a0\ufe0f input grew ${g}\u00d7 since the oldest retained turn (${ins[0]}\u2192${ins[ins.length - 1]} tok) \u2014 context bloat`);
-      rec.push(`Context grew ${g}\u00d7 \u2014 a long thread re-sends everything each turn; a new chat (or a summary) speeds TTFT and cuts tokens.`);
+      find.push(`${ICON.warn} input grew ${g}× since the oldest retained turn (${ins[0]}→${ins[ins.length - 1]} tok) — context bloat`);
+      rec.push(`Context grew ${g}× — a long thread re-sends everything each turn; a new chat (or a summary) speeds TTFT and cuts tokens.`);
     }
 
     const realTurns = turnLog.filter(t => t.tokensReal);
     if (realTurns.length >= 3) {
-      const cr = realTurns.reduce((a, t) => a + (t.cacheRead || 0), 0);
-      const it = realTurns.reduce((a, t) => a + (t.inputTokens || 0), 0);
-      const cc = realTurns.reduce((a, t) => a + (t.cacheCreate || 0), 0);
+      const cr = sumBy(realTurns, 'cacheRead'), it = sumBy(realTurns, 'inputTokens'), cc = sumBy(realTurns, 'cacheCreate');
       const denom = cr + it + cc, hit = denom > 0 ? cr / denom : 0;
-      if (hit < ASSESS.cacheHitLow && n >= 6) { find.push(`\u26a0\ufe0f cache hit ~${(hit * 100).toFixed(0)}% over ${realTurns.length} turns \u2014 caching isn't carrying much context`); rec.push("Low cache reuse \u2014 editing earlier messages or changing the system prompt/tools invalidates the cache; avoid editing history to keep it warm."); }
-      else find.push(`\u2705 cache hit ~${(hit * 100).toFixed(0)}% \u2014 caching is doing its job`);
+      if (hit < ASSESS.cacheHitLow && n >= 6) { find.push(`${ICON.warn} cache hit ~${(hit * 100).toFixed(0)}% over ${realTurns.length} turns — caching isn't carrying much context`); rec.push("Low cache reuse — editing earlier messages or changing the system prompt/tools invalidates the cache; avoid editing history to keep it warm."); }
+      else find.push(`${ICON.pass} cache hit ~${(hit * 100).toFixed(0)}% — caching is doing its job`);
     } else {
-      find.push('\u2139\ufe0f tokens are heuristic (no real usage) \u2014 efficiency/cache estimates limited; run the \ud83d\udd2c probe to confirm the schema');
+      find.push(`${ICON.info} tokens are heuristic (no real usage) — efficiency/cache estimates limited; run the 🔬 probe to confirm the schema`);
     }
 
-    const tpsMed = med(turnLog.map(t => t.tokPerSec));
+    const tpsMed = median(col('tokPerSec'));
     if (tpsMed) {
       const dips = turnLog.filter(t => Number.isFinite(t.tokPerSec) && t.tokPerSec < ASSESS.tpsDip * tpsMed).sort((a, b) => a.tokPerSec - b.tokPerSec).slice(0, 2);
-      for (const t of dips) find.push(`\u26a0\ufe0f turn #${t.id} generated ~${t.tokPerSec} tok/s vs ~${Math.round(tpsMed)} median \u2014 degraded throughput`);
+      for (const t of dips) find.push(`${ICON.warn} turn #${t.id} generated ~${t.tokPerSec} tok/s vs ~${Math.round(tpsMed)} median — degraded throughput`);
     }
 
     const errs = [...statusCounts.entries()].filter(([s]) => s >= 400);
-    if (failCount || errs.length) { find.push(`\u26a0\ufe0f ${failCount} fetch failure(s)${errs.length ? `, statuses ${errs.map(([s, c]) => s + '\u00d7' + c).join(', ')}` : ''}`); rec.push('Errors/retries seen \u2014 check connectivity or rate limits (rateLimits()).'); }
+    if (failCount || errs.length) { find.push(`${ICON.warn} ${failCount} fetch failure(s)${errs.length ? `, statuses ${errs.map(([s, c]) => s + '×' + c).join(', ')}` : ''}`); rec.push('Errors/retries seen — check connectivity or rate limits (rateLimits()).'); }
 
     const truncN = turnLog.filter(t => t.stopReason === 'max_tokens').length;
-    if (truncN) { find.push(`\u26a0\ufe0f ${truncN}/${n} turns hit max_tokens (output truncated)`); rec.push('Truncation: answers are being cut at the output cap \u2014 request continuation or narrow scope.'); }
-    if (streamErrorCount) find.push(`\u26a0\ufe0f ${streamErrorCount} stream error event(s) this session (claude.ai returned an error/limit mid-stream, HTTP 200)`);
+    if (truncN) { find.push(`${ICON.warn} ${truncN}/${n} turns hit max_tokens (output truncated)`); rec.push('Truncation: answers are being cut at the output cap — request continuation or narrow scope.'); }
+    if (streamErrorCount) find.push(`${ICON.warn} ${streamErrorCount} stream error event(s) this session (claude.ai returned an error/limit mid-stream, HTTP 200)`);
     const toolN = turnLog.filter(t => t.stopReason === 'tool_use').length;
-    if (toolN) find.push(`\u2139\ufe0f ${toolN}/${n} turns ended in tool_use (multi-step / agentic round-trips)`);
-    const _shares = turnLog.map(t => t.thinkingShare).filter(Number.isFinite);
-    if (_shares.length) { const _avg = _shares.reduce((a, b) => a + b, 0) / _shares.length; if (_avg >= 0.5) find.push(`\u2139\ufe0f reasoning averages ${Math.round(_avg * 100)}% of output (thinking-heavy)`); }
+    if (toolN) find.push(`${ICON.info} ${toolN}/${n} turns ended in tool_use (multi-step / agentic round-trips)`);
+    const shares = col('thinkingShare');
+    if (shares.length) { const avg = shares.reduce((a, b) => a + b, 0) / shares.length; if (avg >= 0.5) find.push(`${ICON.info} reasoning averages ${Math.round(avg * 100)}% of output (thinking-heavy)`); }
     const q = latestQuota();
     if (q) {
       const hot = q.windows.filter(w => w.usedPct != null && w.usedPct >= 80);
-      if (hot.length) { hot.forEach(w => find.push(`⚠️ quota ${w.name} at ${w.usedPct}% used${w.resetsInMs > 0 ? ` (resets ${fmtDur(w.resetsInMs)})` : ''}`)); rec.push('Approaching a usage-window limit — pace requests or switch model until it resets.'); }
-      else find.push(`ℹ️ quota: ${fmtQuotaLine(q)}`);
-      if (q.overageDisabledReason) find.push(`ℹ️ overage disabled (${q.overageDisabledReason}) — requests are blocked at 100%, not billed past it`);
+      if (hot.length) { hot.forEach(w => find.push(`${ICON.warn} quota ${w.name} at ${w.usedPct}% used${w.resetsInMs > 0 ? ` (resets ${fmtDur(w.resetsInMs)})` : ''}`)); rec.push('Approaching a usage-window limit — pace requests or switch model until it resets.'); }
+      else find.push(`${ICON.info} quota: ${fmtQuotaLine(q)}`);
+      if (q.overageDisabledReason) find.push(`${ICON.info} overage disabled (${q.overageDisabledReason}) — requests are blocked at 100%, not billed past it`);
     }
     const sm = window._claudeDebug.summary;
-    if (sm.chatMs > 0) find.push(`\u2139\ufe0f chat span ${fmtDur(sm.chatMs)} \u2014 generated ${fmtDur(sm.engagedMs)} (${Math.round(100 * sm.engagedMs / sm.chatMs)}%), idle ${fmtDur(Math.max(0, sm.chatMs - sm.engagedMs))}`);
+    if (sm.chatMs > 0) find.push(`${ICON.info} chat span ${fmtDur(sm.chatMs)} — generated ${fmtDur(sm.engagedMs)} (${Math.round(100 * sm.engagedMs / sm.chatMs)}%), idle ${fmtDur(Math.max(0, sm.chatMs - sm.engagedMs))}`);
 
-    console.group('\ud83e\udded Assessment (relative to THIS session)');
-    console.log('baseline:', `total med ${fmtMs(medTotal)} / p90 ${fmtMs(p90Total)} \u00b7 TTFT med ${fmtMs(sTtft ? sTtft.median : null)} \u00b7 ${n} turns`);
+    // Build the verdict ONCE, then render it to both the console and the HUD
+    // (mirrors reportProbe — no second assembly pass that can drift out of sync).
+    const baseline = `total med ${fmtMs(medTotal)} / p90 ${fmtMs(p90Total)} · TTFT med ${fmtMs(sTtft ? sTtft.median : null)} · ${n} turns`;
+    const recLines = rec.length ? rec.map(r => '→ ' + r) : ['→ Nothing notable — efficient relative to this session.'];
+    const note = 'Note: session-relative ("typical" = this session, not a global baseline); signals are correlations, not proof.';
+    const status = find.some(f => f.startsWith(ICON.fail)) ? 'fail' : find.some(f => f.startsWith(ICON.warn)) ? 'warn' : 'ok';
+
+    console.group('🧭 Assessment (relative to THIS session)');
+    console.log('baseline:', baseline);
     console.group('findings'); find.forEach(f => console.log(f)); console.groupEnd();
-    if (rec.length) { console.group('recommendations'); rec.forEach(r => console.log('\u2192 ' + r)); console.groupEnd(); }
-    else console.log('\u2192 Nothing notable \u2014 you look efficient relative to this session.');
-    console.log('Note: "typical" = relative to this session, not a global baseline; signals are correlations, not proof.');
+    console.group('recommendations'); recLines.forEach(r => console.log(r)); console.groupEnd();
+    console.log(note);
     console.groupEnd();
-    {
-      const _as = find.some(f => f.startsWith('❌')) ? 'fail' : find.some(f => f.startsWith('⚠')) ? 'warn' : 'ok';
-      const _al = ['baseline: total med ' + fmtMs(medTotal) + ' / p90 ' + fmtMs(p90Total) + ' · TTFT med ' + fmtMs(sTtft ? sTtft.median : null) + ' · ' + n + ' turns'];
-      for (const f of find) _al.push(f);
-      if (rec.length) for (const r of rec) _al.push('→ ' + r);
-      else _al.push('→ Nothing notable — efficient relative to this session.');
-      _al.push('Note: session-relative; correlations, not proof.');
-      renderResultHud('💡 Assessment (this session)', _as, _al);
-    }
+
+    renderResultHud('💡 Assessment (this session)', status, ['baseline: ' + baseline, ...find, ...recLines, note]);
   }
 
   // ─── Fetch interceptor ────────────────────────────────────────────────────────
@@ -1007,6 +1035,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
 
     const id = ++reqCounter;
     const conv = convOf(url);
+    endpointCounts.set(endpointKey(url), (endpointCounts.get(endpointKey(url)) || 0) + 1);
     const t0 = performance.now();
     const stack = captureCallers ? callerStack() : null;   // off by default (perf); enable via _claudeDebug.callers()
 
@@ -1023,6 +1052,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     try {
       const { reqBytes, estInputTokens, inChars, attachments, topKeys, inputApprox, meta } = await bodyInfoP;
       const isCompletion = COMPLETION_RE.test(url);
+      const completionSeq = isCompletion ? ++completionCounter : null;   // Nth completion this session (null for non-completion calls)
 
       console.groupCollapsed(`[REQ #${id}] ${method} ${url}`);
       console.log('  time:    ', new Date().toISOString());
@@ -1174,7 +1204,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
               status,
             });
             if (probing) reportProbe({
-              id, url, conv, endpoint: ep, isCompletion,
+              id, completionSeq, url, conv, endpoint: ep, isCompletion,
               reqParsedKeys: topKeys, inChars, attachments, probe, meta, inputApprox,
             });
           };
@@ -1337,6 +1367,15 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     histogramHud: (metric = 'total') => renderHistHud(metric),
     rates: () => printRates(),
     byConversation: () => byConversation(),
+    endpoints: () => {
+      if (!endpointCounts.size) { console.log('No monitored requests yet.'); return; }
+      const rows = [...endpointCounts.entries()].sort((a, b) => b[1] - a[1]);
+      const total = rows.reduce((a, [, c]) => a + c, 0);
+      console.group(`🌐 Monitored endpoints (${total} requests over ${endpointCounts.size} paths)`);
+      console.table(rows.map(([endpoint, count]) => ({ endpoint, count, pct: `${Math.round(100 * count / total)}%` })));
+      console.log('Last path segment per /api/ request (id-like tails folded to "<parent>/:id"). Counts every monitored call, not just completions.');
+      console.groupEnd();
+    },
     sockets: () => {
       if (!wsLog.length) { console.log('No monitored WebSocket activity.'); return; }
       console.table(wsLog.map(w => ({
@@ -1423,12 +1462,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       console.log('All counters cleared (turns, sockets, chat clocks, calibration, health). Session clock unchanged.');
     },
 
-    export: () => {
-      const json = JSON.stringify(turnLog, null, 2);
-      navigator.clipboard.writeText(json)
-        .then(() => console.log(`Copied ${turnLog.length} turns to clipboard.`))
-        .catch(() => console.log(json));
-    },
+    export: () => copyJson(turnLog, `Copied ${turnLog.length} turns to clipboard.`),
 
     // Compact, paste-ready snapshot for the `hud_audit` workflow: session summary +
     // a slim per-turn array (incl. the new thinking/answer/stop/model fields). Copy
@@ -1455,16 +1489,13 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
         streamErrors: streamErrorCount,
         data,
       };
-      const json = JSON.stringify(snapshot, null, 2);
-      navigator.clipboard.writeText(json)
-        .then(() => console.log(`hud_audit snapshot copied (${data.length} turns) — paste to Claude with "hud_audit".`))
-        .catch(() => console.log(json));
+      copyJson(snapshot, `hud_audit snapshot copied (${data.length} turns) — paste to Claude with "hud_audit".`);
     },
 
     help: () => {
       const g = (t, items) => { console.group(t); items.forEach(i => console.log(i)); console.groupEnd(); };
       console.group('%c\ud83d\udee0 _claudeDebug commands', 'font-weight:bold');
-      g('Reports', ['report() \u2014 summary + rates + histogram', 'rates() \u2014 1m/5m/1h/24h messages/tokens/bytes', 'byConversation() \u2014 per-conversation totals', 'turns() \u2014 per-turn table', 'stats() \u2014 TTFT/stream/total min/median/p90/max', 'health() \u2014 in-flight/fails/status', 'rateLimits() \u2014 last rate-limit headers']);
+      g('Reports', ['report() \u2014 summary + rates + histogram', 'rates() \u2014 1m/5m/1h/24h messages/tokens/bytes', 'byConversation() \u2014 per-conversation totals', 'endpoints() \u2014 per-endpoint request tally', 'turns() \u2014 per-turn table', 'stats() \u2014 TTFT/stream/total min/median/p90/max', 'health() \u2014 in-flight/fails/status', 'rateLimits() \u2014 last rate-limit headers']);
       g('Visuals (on-page)', ['hud() \u2014 toggle overlay', 'histogramHud() \u2014 histogram panel (cycles metric)', 'histogram(metric?) \u2014 histogram to console']);
       g('Diagnostics', ['probe() \u2014 arm schema probe (\ud83d\udd2c)', 'assess() \u2014 outliers & efficiency (\ud83d\udca1)', 'time() \u2014 session/chat/engaged/idle', 'calibration() \u2014 current chars/token', 'callers(on?) \u2014 toggle per-request caller capture']);
       g('Data', ['data \u2014 turn array (getter)', 'summary \u2014 key metrics (getter)', 'export() \u2014 full turn JSON to clipboard', 'audit() \u2014 compact hud_audit snapshot (\ud83e\uddfe)', 'pending() \u2014 in-flight requests', 'sockets() \u2014 WebSocket activity']);
@@ -1489,8 +1520,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     get data() { return [...turnLog]; },
 
     get summary() {
-      const totals = turnLog.map(t => t.total).filter(Number.isFinite);
-      const ttfts  = turnLog.map(t => t.ttft).filter(Number.isFinite);
+      const totals = col('total');
+      const ttfts  = col('ttft');
       const st = calcStats(totals);
       const tt = calcStats(ttfts);
       const tokensTotal = turnLog.reduce((a, t) =>
@@ -1712,12 +1743,16 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       boxShadow: '0 4px 16px rgba(0,0,0,0.4)', backdropFilter: 'blur(2px)',
     });
     const head = document.createElement('div');
-    css(head, { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' });
+    css(head, { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', cursor: 'move' });
+    head.title = 'Drag to move';
     const title = document.createElement('span');
     const body = document.createElement('div');
     head.appendChild(title);
     root.appendChild(head);
     root.appendChild(body);
+    // Same drag behavior as the main HUD: grab the header to reposition. Buttons
+    // the callers add later still click, since makeDraggable ignores BUTTON targets.
+    makeDraggable(root, head);
     return { root, head, title, body };
   }
 
@@ -1765,6 +1800,13 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     css(histTitle, { fontWeight: 'bold', color: '#cdbcff' });
     p.head.appendChild(mkBtn('×', 'Close histogram', () => destroyHistHud()));
     (document.body || document.documentElement).appendChild(histRoot);
+    // Position once, at creation: sit just below the main HUD if it's visible,
+    // else keep the default top. Done here (not in renderHistHud) so re-renders
+    // on metric-cycle don't yank the panel back after the user has dragged it.
+    if (hudRoot && hudRoot.getBoundingClientRect) {
+      const r = hudRoot.getBoundingClientRect();
+      if (r.height) histRoot.style.top = Math.round(r.bottom + 8) + 'px';
+    }
   }
 
   function destroyHistHud() {
@@ -1777,14 +1819,6 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       ensureHistHud();
       const h = histogramData(metric, 5);
       histTitle.textContent = `📊 ${h.label}`;
-      // Sit just below the main HUD if it's visible, else lower-right (clear of
-      // claude.ai's file-preview close button).
-      let top = 80;
-      if (hudRoot && hudRoot.getBoundingClientRect) {
-        const r = hudRoot.getBoundingClientRect();
-        if (r.height) top = Math.round(r.bottom + 8);
-      }
-      histRoot.style.top = top + 'px';
       while (histBody.firstChild) histBody.removeChild(histBody.firstChild);
       const mk = (txt, props) => { const d = document.createElement('div'); d.textContent = txt; if (props) css(d, props); return d; };
       if (h.note) { histBody.appendChild(mk(h.note, { color: '#cdbcff' })); return; }
