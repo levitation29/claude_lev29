@@ -183,7 +183,9 @@ echo "🔢 Turn $turns · tool calls so far: $tools"
 
 **session_counts_header** — Trigger: at the start of every response, run session_counts and display its output on its own line first. Skip silently if /home/claude/.session_counts cannot be created or written.
 
-
 **session_counts_resync** T C — Reset the session counter file to a known-good state. Run: f=/home/claude/.session_counts; echo "T C" > "$f"; cat "$f". T is the turn number that just completed (next header will display T+1); C is the cumulative tool-call total through end of that turn. Bypasses the normal increment-on-read flow. Use when drift accumulates or after a session restart. Both args required; no defaults — silently zeroing would mask the drift the command is meant to fix.
 
-`trim_for_preferences` — read `command_2.notes` (uploads or working path); produce a condensed paste-ready version: strip all prose explanation, motivation, examples, and cross-session blocks; collapse section headers into bold inline labels; reduce each command to a single terse line; save as `command_2_preferences.notes` and publish to outputs.
+**trim_for_preferences** — read `command_2.notes` (uploads or working path); produce a condensed paste-ready version: strip all prose explanation, motivation, examples, and cross-session blocks; collapse section headers into bold inline labels; reduce each command to a single terse line; save as `command_2_preferences.notes` and publish to outputs.
+
+**xyzzy** touch_start ; session_time_header ; session_counts ; session_counts_header ;
+Since you told me you have structural problems in following those requirements, remember to not do your default action, which is, write text first, then remember the tool call. Tool call must be literally the first thing in your response, no text before it. 
