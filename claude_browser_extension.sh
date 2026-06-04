@@ -441,6 +441,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   // analyzed (KEYS only, never content) and a PASS/WARN/FAIL report is printed.
   function runSchemaProbe() {
     probeArmed = true;
+    renderResultHud('🔬 Schema probe armed', 'info', ['Send ONE message. The next streamed turn is analyzed; the verdict shows here (and in the console).']);
     console.log('%c🔬 Schema probe armed — send ONE message; the next streamed turn is analyzed and a report prints here.',
       'color:#6c47ff;font-weight:bold');
   }
@@ -490,6 +491,10 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     console.log(`event types seen: ${[...r.probe.types].join(', ') || '(none)'}`);
     console.log(problems ? `${W} ${problems} potential problem(s) flagged above.` : `${P} No problems detected — the parser matches the live shapes.`);
     console.groupEnd();
+    const _status = lines.some(l => l.startsWith(F)) ? 'fail' : problems ? 'warn' : 'ok';
+    const _summary = problems ? `${W} ${problems} potential problem(s) flagged above.` : `${P} No problems detected — the parser matches the live shapes.`;
+    renderResultHud(`🔬 Schema probe — turn #${r.id} (${r.probe.samples} events)`, _status,
+      [...lines, `event types: ${[...r.probe.types].join(', ') || '(none)'}`, _summary]);
     probeArmed = false;
   }
 
@@ -796,7 +801,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   // ─── Assessment: outliers + efficiency, relative to THIS session ────────────
   function runAssessment() {
     const n = turnLog.length;
-    if (n < 3) { console.log(`Need \u22653 completed turns to assess (have ${n}).`); return; }
+    if (n < 3) { console.log(`Need \u22653 completed turns to assess (have ${n}).`); renderResultHud('💡 Assessment', 'info', ['Need at least 3 completed turns before assessing (have ' + n + ').']); return; }
     const med = arr => { const a = arr.filter(Number.isFinite).sort((x, y) => x - y); return a.length ? quantile(a, 0.5) : null; };
     const totals = turnLog.map(t => t.total).filter(Number.isFinite);
     const sT = calcStats(totals), sTtft = calcStats(turnLog.map(t => t.ttft).filter(Number.isFinite));
@@ -859,6 +864,15 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     else console.log('\u2192 Nothing notable \u2014 you look efficient relative to this session.');
     console.log('Note: "typical" = relative to this session, not a global baseline; signals are correlations, not proof.');
     console.groupEnd();
+    {
+      const _as = find.some(f => f.startsWith('❌')) ? 'fail' : find.some(f => f.startsWith('⚠')) ? 'warn' : 'ok';
+      const _al = ['baseline: total med ' + fmtMs(medTotal) + ' / p90 ' + fmtMs(p90Total) + ' · TTFT med ' + fmtMs(sTtft ? sTtft.median : null) + ' · ' + n + ' turns'];
+      for (const f of find) _al.push(f);
+      if (rec.length) for (const r of rec) _al.push('→ ' + r);
+      else _al.push('→ Nothing notable — efficient relative to this session.');
+      _al.push('Note: session-relative; correlations, not proof.');
+      renderResultHud('💡 Assessment (this session)', _as, _al);
+    }
   }
 
   // ─── Fetch interceptor ────────────────────────────────────────────────────────
@@ -1256,6 +1270,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
 
     stop: () => {
       destroyHud();
+      destroyResultHud();
       window.fetch = origFetch;
       window.WebSocket = origWebSocket;
       perfObs?.disconnect();
@@ -1425,6 +1440,62 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
 
   // ── Histogram overlay (second panel) ───────────────────────────
   // Rendered as DOM (CSP-safe via css()), only on click; never auto-refreshes.
+  // ─── Shared result panel (probe & assess render here, not just the console) ──
+  let resultRoot = null, resultHead = null, resultTitle = null, resultBody = null;
+  const RESULT_STATUS = {
+    ok:   { bd: '#3fb950', bg: 'rgba(63,185,80,0.18)',  tag: 'PASS'  },
+    warn: { bd: '#d29922', bg: 'rgba(210,153,34,0.18)', tag: 'CHECK' },
+    fail: { bd: '#f85149', bg: 'rgba(248,81,73,0.18)',  tag: 'FAIL'  },
+    info: { bd: '#6c47ff', bg: 'rgba(108,71,255,0.18)', tag: ''      },
+  };
+
+  function ensureResultHud() {
+    if (resultRoot) return;
+    resultRoot = document.createElement('div');
+    css(resultRoot, {
+      position: 'fixed', left: '12px', top: '80px', zIndex: '2147483647',
+      font: '12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace', color: '#fff',
+      background: 'rgba(20,16,38,0.96)', border: '1px solid #6c47ff', borderRadius: '8px',
+      boxShadow: '0 4px 16px rgba(0,0,0,0.4)', maxWidth: '420px', maxHeight: '70vh',
+      overflow: 'auto', backdropFilter: 'blur(2px)',
+    });
+    resultHead = document.createElement('div');
+    css(resultHead, { display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      gap: '8px', padding: '6px 10px', fontWeight: 'bold', borderBottom: '1px solid rgba(108,71,255,0.4)' });
+    resultTitle = document.createElement('span');
+    resultHead.appendChild(resultTitle);
+    resultHead.appendChild(mkBtn('×', 'Close', () => destroyResultHud()));
+    resultBody = document.createElement('div');
+    css(resultBody, { padding: '4px 0' });
+    resultRoot.appendChild(resultHead);
+    resultRoot.appendChild(resultBody);
+    (document.body || document.documentElement).appendChild(resultRoot);
+  }
+
+  function destroyResultHud() {
+    if (resultRoot && resultRoot.parentNode) resultRoot.parentNode.removeChild(resultRoot);
+    resultRoot = resultHead = resultTitle = resultBody = null;
+  }
+
+  // status: 'ok' | 'warn' | 'fail' | 'info'. lines keep their ✅/⚠️/❌ prefixes.
+  function renderResultHud(title, status, lines) {
+    whenBody(() => {
+      ensureResultHud();
+      const c = RESULT_STATUS[status] || RESULT_STATUS.info;
+      css(resultRoot, { border: '1px solid ' + c.bd });
+      css(resultHead, { background: c.bg });
+      resultTitle.textContent = c.tag ? (title + '  —  ' + c.tag) : title;
+      while (resultBody.firstChild) resultBody.removeChild(resultBody.firstChild);
+      for (const ln of lines) {
+        const row = document.createElement('div');
+        css(row, { padding: '3px 10px', whiteSpace: 'normal', overflowWrap: 'anywhere',
+          borderTop: '1px solid rgba(255,255,255,0.06)' });
+        row.textContent = ln;
+        resultBody.appendChild(row);
+      }
+    });
+  }
+
   function ensureHistHud() {
     if (histRoot) return;
     histRoot = document.createElement('div');

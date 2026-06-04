@@ -212,7 +212,8 @@ down both overlays.
   `ratesSnapshot/printRates`, `byConversation`, `runAssessment` (outliers +
   efficiency), schema probe: `runSchemaProbe/collectProbe/reportProbe`, HUD:
   `css/mkBtn/ensureHud/setCollapsed/updateHud/toggleHud/destroyHud/whenBody`,
-  histogram panel: `ensureHistHud/destroyHistHud/renderHistHud`.
+  histogram panel: `ensureHistHud/destroyHistHud/renderHistHud`; shared result
+  panel for probe/assess verdicts: `ensureResultHud/destroyResultHud/renderResultHud`.
 - **Turn record:** `{ id, conv, url, endpoint, isCompletion, ts, t0, t1, t2, ttft,
   ttftEvent, streamDuration, total, reads, events, reqBytes, inChars, attachments,
   estInputTokens, estOutputTokens, inputTokens, outputTokens, tokensReal,
@@ -280,6 +281,11 @@ rates, refreshing every `HUD_REFRESH_MS`.
 Header buttons: **📊 histogram**, **🔬 schema probe**, **💡 assess**,
 **⧉ copy JSON**, **▾ collapse**, **× hide**.
 Toggle from code with `_claudeDebug.hud()` / `hud(true)` / `hud(false)`.
+
+The **🔬 probe** and **💡 assess** buttons render their verdicts into a
+color-coded on-page panel on the left edge (green PASS / amber CHECK / red FAIL),
+in addition to the console, so the result is readable without DevTools; the panel
+has its own × and is torn down by `stop()`.
 
 The **📊 button** opens a *second* panel that renders the histogram as DOM bars
 (sized with `el.style.width`, CSP-clean) just below the main HUD. It updates only
@@ -409,7 +415,9 @@ Real-usage capture, output sizing, conversation-id parsing, and completion
 classification all depend on claude.ai's **undocumented** internal shapes, so the
 probe lets you confirm they still match. Arm it (🔬 button or
 `_claudeDebug.probe()`), send one message, and the next streamed turn is analyzed
-— **keys only, never content** — and a PASS/WARN/FAIL report prints:
+— **keys only, never content** — and a PASS/WARN/FAIL verdict appears both in
+the console **and** in an on-page panel (left edge, color-coded: green PASS /
+amber CHECK / red FAIL, with its own × to close):
 
 - request body parsed? top-level keys; content-char count; attachments excluded.
 - endpoint classified as a completion (so it counts as a message)?
@@ -464,6 +472,10 @@ total, median TTFT) and flags, each with a recommendation where actionable:
 - **Throughput dips** — turns generating < `ASSESS.tpsDip`× the median tok/s (default 0.5).
 - **Errors** — fetch failures and 4xx/5xx counts.
 - **Engaged vs idle** time for the session.
+
+Both the findings and the baseline render in the same on-page panel as the probe
+(left edge, amber CHECK if anything is flagged, green PASS otherwise) as well as
+the console, so you don't need DevTools open to read the verdict.
 
 Caveat baked into the output: "typical" means relative to **this** session, not a
 global baseline, and the signals are correlations — the monitor sees the captured
