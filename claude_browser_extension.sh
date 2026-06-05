@@ -391,13 +391,14 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     }
     return (q.windows.length || q.type) ? q : null;
   }
-  function fmtQuotaLine(q) {
+  function fmtQuotaWindow(w) {   // value only, e.g. "80% left (resets 2h 13m)"; caller adds the window name
+    const head = w.usedPct != null ? `${100 - w.usedPct}% left` : (w.leftN != null ? `${w.leftN} left` : (w.status || '?'));
+    const rs = (w.resetsInMs != null && w.resetsInMs > 0) ? ` (resets ${fmtDur(w.resetsInMs)})` : '';
+    return `${head}${rs}`;
+  }
+  function fmtQuotaLine(q) {      // single-line form for console/log; the HUD wraps per-window instead
     if (!q) return null;
-    const parts = q.windows.map(w => {
-      const head = w.usedPct != null ? `${100 - w.usedPct}% left` : (w.leftN != null ? `${w.leftN} left` : (w.status || '?'));
-      const rs = (w.resetsInMs != null && w.resetsInMs > 0) ? ` (resets ${fmtDur(w.resetsInMs)})` : '';
-      return `${w.name} ${head}${rs}`;
-    });
+    const parts = q.windows.map(w => `${w.name} ${fmtQuotaWindow(w)}`);
     let s = parts.join(' · ') || (q.type || '');
     if (q.overageInUse) s += ' · OVERAGE ON';
     else if (q.overageDisabledReason) s += ` · overage off (${q.overageDisabledReason})`;
@@ -1685,7 +1686,19 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     hudTitle.textContent = 'Claude Debug';
     const oneHTok = oneH.inTokens + oneH.outTokens;
     const _q = latestQuota();
-    const quotaLine = _q ? `quota        ${fmtQuotaLine(_q)}` : null;
+    // Each usage window (5h, 7d, …) gets its OWN line, labelled "<window> quota"
+    // (e.g. "5h quota", "7d quota"), so a long window value never bleeds past the
+    // 340px box (whiteSpace:'pre' = no auto-wrap). The overage flag, having no
+    // window of its own, sits on a trailing indented line.
+    const quotaLines = [];
+    if (_q) {
+      const QPAD = '             ';   // 13 spaces = value column (matches label width)
+      for (const w of _q.windows) {
+        quotaLines.push(`${w.name} quota`.padEnd(13) + fmtQuotaWindow(w));
+      }
+      if (_q.overageInUse) quotaLines.push(`${QPAD}OVERAGE ON`);
+      else if (_q.overageDisabledReason) quotaLines.push(`${QPAD}overage off (${_q.overageDisabledReason})`);
+    }
     hudBody.textContent = [
       `turns        ${s.turns}   (in-flight ${s.inFlight})`,
       `time         session ${fmtDur(s.sessionMs)} · chat ${fmtDur(s.chatMs)}`,
@@ -1695,7 +1708,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       `tokens       ${s.turns && s.exactTurns === s.turns ? '' : '~'}${s.tokensTotal}  (in+out; ${s.exactTurns}/${s.turns} exact)`,
       `last 1h      ${oneH.messages} msgs · ~${oneHTok} tok`,
       `last 24h     ${s.msgsLast24h} msgs`,
-      ...(quotaLine ? [quotaLine] : []),
+      ...quotaLines,
       `~ / day      ~${oneH.messages * 24} msgs · ~${oneHTok * 24} tok`,
     ].join('\n');
     hudFoot.textContent = `~ = est (chars/${charsPerToken().toFixed(2)}); no ~ = exact from stream`;
