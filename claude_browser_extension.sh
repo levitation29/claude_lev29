@@ -179,7 +179,7 @@ cat > "$EXTDIR/manifest.json" << 'EOF'
 {
   "manifest_version": 3,
   "name": "Claude Developer Debug",
-  "version": "1.2",
+  "version": "1.6",
   "description": "Injects the Claude network/performance debug monitor into claude.ai's page context (MAIN world). Logs all API requests, SSE streams, turn latency, and TTFT to the DevTools console.",
   "content_scripts": [
     {
@@ -302,8 +302,10 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   const BAR_WIDTH          = 30;     // max histogram bar width, in chars
   const STACK_CALLER_FRAMES = 3;     // how many caller frames to attribute a fetch
   const EST_CHARS_PER_TOKEN = 3.6;   // rough heuristic for English prose (NOT exact)
+  const SCHEMA_VERSION     = 2;      // hud_audit snapshot schema (bump when fields change)
   const SLOW_MIN_SAMPLES   = 10;     // need this many turns before flagging [SLOW]
   const HUD_REFRESH_MS     = 1000;   // on-page overlay refresh cadence
+  const QUOTA_POLL_MS      = 60000;  // while the HUD is open+visible, refresh exact /usage at most this often
   const BODY_SCAN_MAX      = 524288; // bodies larger than this (chars) skip the per-leaf walk
   const SLOW_P90_REFRESH   = 25;     // recompute the [SLOW] p90 baseline every N turns, not every turn
   const ASSESS = {                   // session-relative assessment thresholds (tune freely)
@@ -321,11 +323,12 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   // ─── State ──────────────────────────────────────────────────────────────────
   const origFetch = window.fetch;
   const origWebSocket = window.WebSocket;
+  const origXHR = window.XMLHttpRequest;
   const pendingRequests = new Map();
   const turnLog = [];   // see record shape in recordTurn()
   const wsLog = [];     // { url, opened, closed, sent, recv }
   let reqCounter = 0;
-  let completionCounter = 0;   // session count of completion turns (the "message #" the probe reports alongside the absolute request id)
+  let completionCounter = 0;   // session count of FRESH completion turns (retries excluded; the "message #" the probe reports alongside the absolute request id)
   const endpointCounts = new Map();   // normalized endpoint key -> count, over every monitored request (see endpointKey / endpoints())
   const encoder = new TextEncoder();
 
@@ -335,11 +338,17 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   let streamErrorCount = 0;            // SSE "error" events (claude.ai returns these with HTTP 200)
   const statusCounts = new Map();      // HTTP status -> count
   let lastRateLimit = null;            // latest anthropic-ratelimit-* / retry-after snapshot
+  let orgId = null;                    // organization id seen in any monitored URL — enables refreshQuota()
   let probeArmed = false;              // schema-probe: analyze the next monitored SSE turn
   let captureCallers = false;          // capture a JS stack per request (off by default; priciest per-request op)
   let slowP90 = null, slowP90At = 0;   // cached [SLOW] baseline + the turn count it was computed at
   const COMPLETION_RE    = /\/(retry_)?completion\b/i;            // a chat-completion stream (.../chat_conversations/<id>/completion)
+  const RETRY_RE         = /\/retry_completion\b/i;               // a regenerated answer — does NOT consume a fresh message slot the way a new turn does
   const SLOW_ENDPOINT_RE = /\/(retry_)?completion\b|upload-file\b/i; // slow by nature: stream TTFT or a file upload
+  // Endpoints the web app hits to render its own usage UI — best-effort, no-key
+  // source of plan tier + exact rolling-window quota (response JSON is scanned for
+  // tier/limit fields; content is never logged).
+  const USAGE_RE         = /(usage|message_limit|rate_limit|\/limits|subscription|bootstrap|statsig|\/account\b)/i;
   const DELTA_META_KEYS  = ['type', 'index', 'stop_reason', 'stop_sequence', 'stop_details', 'message', 'display_content']; // non-content delta fields
 
   // Time tracking. SESSION = since the monitor loaded (page open, incl. idle);
@@ -347,8 +356,49 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   const SESSION_START = Date.now();
   let firstTurnTs = null, lastTurnTs = null, engagedMs = 0;
 
+  // Per-load nonce. reqCounter (and thus turn `id`) restarts at 1 every page load,
+  // so `id` alone is NOT unique across reloads/pastes; snapshots carry this nonce
+  // and a composite rowKey (`nonce:id`) so a ledger can dedup turns correctly.
+  const SESSION_NONCE = `${SESSION_START.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // Subscription state (no API key needed). Plan tier + rolling-window quota are
+  // the metrics a Free/Pro/Max account is actually metered on. Both persist across
+  // reloads via localStorage so a single snapshot can reflect the true window.
+  let detectedPlan = null;
+  try { detectedPlan = localStorage.getItem('claudeDebugPlan') || null; } catch (e) {}
+  let quotaWindows = {};   // window-name -> { usedPct, status, resetsAt, capturedAt }
+  try { const j = localStorage.getItem('claudeDebugQuota'); if (j) quotaWindows = JSON.parse(j) || {}; } catch (e) {}
+  { const _now = Date.now();   // drop windows whose reset has already passed
+    for (const k in quotaWindows) { const w = quotaWindows[k]; if (w && Number.isFinite(w.resetsAt) && w.resetsAt < _now) delete quotaWindows[k]; } }
+
+  // Short history of usedPct readings per window (for burn-rate / minutes-to-cap).
+  let usageHistory = {};   // window-name -> [{ ts, used }]
+  try { const j = localStorage.getItem('claudeDebugUsageHist'); if (j) usageHistory = JSON.parse(j) || {}; } catch (e) {}
+  { const _now = Date.now();   // drop readings older than an hour on load
+    for (const k in usageHistory) { const a = usageHistory[k]; usageHistory[k] = Array.isArray(a) ? a.filter(x => x && _now - x.ts < 3600000) : []; } }
+
+  // Pace time-series per window (for the tachometer graph): one { ts, mult } point
+  // appended each /usage poll once a pace is computable. Retained PACE_LOG_MS so the
+  // graph can show the whole 5h window's worth of "RPM" history.
+  const PACE_LOG_MS = 5 * 60 * 60 * 1000;   // keep ~5h of pace points
+  let paceLog = {};        // window-name -> [{ ts, mult }]
+  try { const j = localStorage.getItem('claudeDebugPaceLog'); if (j) paceLog = JSON.parse(j) || {}; } catch (e) {}
+  { const _now = Date.now();
+    for (const k in paceLog) { const a = paceLog[k]; paceLog[k] = Array.isArray(a) ? a.filter(x => x && _now - x.ts < PACE_LOG_MS) : []; } }
+  function recordPaceSample(name, mult) {
+    if (typeof mult !== 'number' || !Number.isFinite(mult)) return;
+    const now = Date.now();
+    const arr = paceLog[name] || (paceLog[name] = []);
+    const last = arr[arr.length - 1];
+    if (!last || now - last.ts > 5000) arr.push({ ts: now, mult });   // skip rapid dupes
+    const cutoff = now - PACE_LOG_MS;
+    while (arr.length > 1 && arr[0].ts < cutoff) arr.shift();
+    try { localStorage.setItem('claudeDebugPaceLog', JSON.stringify(paceLog)); } catch (e) {}
+  }
+
   // On-page overlay (HUD) state
   let hudRoot = null, hudTitle = null, hudBody = null, hudFoot = null, hudInterval = null, hudCollapsed = true;
+  let lastQuotaPollAt = 0;              // throttle for the HUD's background /usage refresh
   let hudPos = null;                   // {left, top} drag position (persisted best-effort)
   // Metrics the HUD 📊 button cycles through on repeated clicks.
   const HUD_HIST_METRICS = ['total', 'ttft', 'ttftEvent', 'streamDuration',
@@ -356,6 +406,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   let hudHistIdx = 0;
   // Second overlay panel that renders the histogram as DOM on click (no auto-refresh).
   let histRoot = null, histTitle = null, histBody = null;
+  // Tachometer panel: SVG pace-vs-time graph; auto-refreshes while open.
+  let paceRoot = null, paceTitle = null, paceBody = null;
 
   // ─── Small helpers ──────────────────────────────────────────────────────────
   const fmtMs = v =>
@@ -382,6 +434,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
         const w = W[k]; if (!w || typeof w !== 'object') continue;
         const util = Number.isFinite(w.utilization) ? w.utilization : null;
         q.windows.push({ name: k, status: w.status || null,
+          util: util,                                          // raw 0..1 float (null if absent); used by windowPace()
           usedPct: util != null ? Math.round(util * 100) : null,
           resetsInMs: Number.isFinite(w.resets_at) ? w.resets_at * 1000 - Date.now() : null });
       }
@@ -407,6 +460,240 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   function latestQuota() {   // most recent turn carrying a limit (error turns have none)
     for (let i = turnLog.length - 1; i >= 0; i--) { const q = quotaSummary(turnLog[i].messageLimit); if (q) return q; }
     return null;
+  }
+
+  // Persist each rolling window's utilisation so a snapshot reflects the real
+  // subscription window even across page reloads. Keyed by window name; we keep
+  // the freshest reading per reset epoch.
+  function persistQuota(messageLimit) {
+    const q = quotaSummary(messageLimit);
+    if (!q || !q.windows || !q.windows.length) return;
+    const now = Date.now();
+    for (const w of q.windows) {
+      if (!w.name) continue;
+      const resetsAt = Number.isFinite(w.resetsInMs) ? now + w.resetsInMs : null;
+      quotaWindows[w.name] = { usedPct: (w.usedPct != null ? w.usedPct : null), status: w.status || null, resetsAt, capturedAt: now };
+    }
+    try { localStorage.setItem('claudeDebugQuota', JSON.stringify(quotaWindows)); } catch (e) {}
+  }
+
+  // The /api/organizations/<id>/usage payload is a DIFFERENT shape from the SSE
+  // message_limit: a flat map of window-name -> { utilization (0..100 PERCENT),
+  // resets_at (ISO string) }, plus an extra_usage (overage) block. Many windows
+  // are null when not active for the plan. We accept any value that looks like a
+  // window so new server-side windows are captured without a code change.
+  const USAGE_WINDOW_ALIAS = { five_hour: '5h', seven_day: '7d', seven_day_opus: '7d_opus',
+    seven_day_sonnet: '7d_sonnet', seven_day_cowork: '7d_cowork', seven_day_oauth_apps: '7d_oauth' };
+  function noteUsageEndpoint(j) {
+    if (!j || typeof j !== 'object') return false;
+    const now = Date.now();
+    let hit = false;
+    for (const k in j) {
+      const w = j[k];
+      if (!w || typeof w !== 'object') continue;
+      if (typeof w.utilization !== 'number' || w.resets_at == null) continue;   // skip nulls / non-windows
+      const resetsAt = Date.parse(w.resets_at);
+      const name = USAGE_WINDOW_ALIAS[k] || k;
+      quotaWindows[name] = { usedPct: Math.round(w.utilization), status: null,   // endpoint already reports 0..100
+        resetsAt: Number.isFinite(resetsAt) ? resetsAt : null, capturedAt: now };
+      recordUsageSample(name, Math.round(w.utilization));   // feed the burn-rate history
+      hit = true;
+    }
+    const ex = j.extra_usage;   // overage / pay-as-you-go credits
+    if (ex && typeof ex === 'object' && ex.is_enabled && typeof ex.utilization === 'number') {
+      quotaWindows['extra'] = { usedPct: Math.round(ex.utilization), status: 'overage', resetsAt: null, capturedAt: now };
+      hit = true;
+    }
+    // Now that this poll's usedPct samples are recorded, compute the 5h pace and log
+    // it as a tachometer point (null early on, when there is no baseline yet).
+    if (hit) { const pp = usagePace('5h'); if (pp && pp.multiplier != null) recordPaceSample('5h', pp.multiplier); }
+    if (hit) { try { localStorage.setItem('claudeDebugQuota', JSON.stringify(quotaWindows)); } catch (e) {} }
+    return hit;
+  }
+
+  // Silent fetch of the exact usage endpoint (no console output). Rides the page's
+  // session cookies; origFetch so it isn't re-instrumented. Returns the JSON or null.
+  async function fetchUsage() {
+    if (!orgId) return null;
+    try {
+      const r = await origFetch(`/api/organizations/${orgId}/usage`, { method: 'GET', credentials: 'same-origin', headers: { 'content-type': 'application/json' } });
+      if (!r.ok) return null;
+      const j = await r.json();
+      noteUsageEndpoint(j);
+      return j;
+    } catch { return null; }
+  }
+  // Flatten the persisted windows into a snapshot array (resets recomputed to "ms from now").
+  function quotaWindowsSnapshot() {
+    const out = [];
+    for (const k in quotaWindows) {
+      const w = quotaWindows[k];
+      const p = usagePace(k);
+      out.push({ window: k, usedPct: w.usedPct ?? null, status: w.status || null,
+        resetsInMs: Number.isFinite(w.resetsAt) ? w.resetsAt - Date.now() : null, capturedAt: w.capturedAt || null,
+        paceMultiplier: p && p.multiplier != null ? +p.multiplier.toFixed(2) : null,
+        estMinsLeft: p ? p.estMinsLeft : null });
+    }
+    return out;
+  }
+
+  // Best-effort, no-key plan detection from a usage/account response the web app
+  // already fetched. Scans common tier fields; never logs content. Latches once.
+  const PLAN_RE = /\b(free|pro|max|team|enterprise)\b/i;
+  function notePlanFromJson(obj) {
+    if (detectedPlan || !obj || typeof obj !== 'object') return;
+    const cand = obj.subscription || obj.plan || obj.tier || obj.rate_limit_tier ||
+      (obj.account && (obj.account.subscription || obj.account.plan || obj.account.tier)) ||
+      (obj.organization && (obj.organization.billing_type || obj.organization.rate_limit_tier));
+    let s = null;
+    if (typeof cand === 'string') s = cand;
+    else if (cand && typeof cand === 'object') s = cand.tier || cand.name || cand.plan || null;
+    if (typeof s !== 'string') return;
+    const m = s.match(PLAN_RE);
+    if (m) { detectedPlan = m[1].toLowerCase(); try { localStorage.setItem('claudeDebugPlan', detectedPlan); } catch (e) {} }
+  }
+
+  // Pull a message_limit-shaped object out of a usage payload (top level or one deep).
+  function findMessageLimit(j) {
+    if (!j || typeof j !== 'object') return null;
+    if (j.message_limit || j.windows) return j;
+    for (const k in j) { const v = j[k]; if (v && typeof v === 'object' && (v.message_limit || v.windows)) return v; }
+    return null;
+  }
+
+  // Heuristic cross-check: count rendered assistant turns in the DOM. If this
+  // diverges from the completion count, traffic is escaping the fetch/XHR patches
+  // (e.g. a Web Worker or service worker). Selectors are best-effort and may drift.
+  function domTurnCount() {
+    try {
+      const sel = document.querySelectorAll('[data-testid="assistant-turn"], div.font-claude-message, [data-is-streaming]');
+      return sel ? sel.length : null;
+    } catch { return null; }
+  }
+
+  // Stop-reason tally across retained turns (quick drift signal for the ledger).
+  function stopReasonDistribution() {
+    const out = {};
+    for (const t of turnLog) { const k = t.stopReason || 'none'; out[k] = (out[k] || 0) + 1; }
+    return out;
+  }
+
+  // --- usage-window pace ------------------------------------------------------
+  // How fast is a rolling usage window's utilization moving, relative to the
+  // clock?  Over the window's own length the bar would travel 0->100% if you
+  // consumed evenly, so "time-implied" change over `elapsedMin` is
+  // elapsedMin / windowMin of the full budget.  The multiplier is the actual
+  // utilisation change divided by that:
+  //     multiplier = ΔutilFraction * windowMin / elapsedMin
+  //   = 1.0  -> burning exactly at the pace that hits 100% at window end
+  //   > 1.0  -> faster than the clock (utilisation climbing quicker)
+  //   < 1.0  -> slower; 0 -> flat; negative -> utilisation falling (recovering,
+  //             as old usage ages out of the rolling window).
+  const PACE_LOOKBACK_MS = 10 * 60 * 1000;   // "last 10 minutes"
+
+  function windowMinutes(name) {             // '5h'->300, '7d'->10080, '30m'->30
+    const m = /^(\d+)\s*([mhd])$/.exec(name || '');
+    if (!m) return null;
+    const n = +m[1];
+    return m[2] === 'm' ? n : m[2] === 'h' ? n * 60 : n * 1440;
+  }
+  function windowUtilAt(i, name) {           // raw utilisation (0..1) for `name` in turnLog[i], or null
+    const q = quotaSummary(turnLog[i].messageLimit);
+    if (!q) return null;
+    const w = q.windows.find(x => x.name === name);
+    return w && w.util != null ? w.util : null;
+  }
+  function windowPace(name, lookbackMs = PACE_LOOKBACK_MS) {
+    const winMin = windowMinutes(name);
+    if (!winMin) return null;
+    // newest sample carrying this window's utilisation
+    let iNow = -1, utilNow = null;
+    for (let i = turnLog.length - 1; i >= 0; i--) {
+      const u = windowUtilAt(i, name);
+      if (u != null) { iNow = i; utilNow = u; break; }
+    }
+    if (iNow < 0) return null;
+    const tsNow = turnLog[iNow].ts;
+    // Prefer the OLDEST sample within the lookback window (interval ~= lookback);
+    // if none is inside it, fall back to the most recent sample just before it so
+    // a baseline still exists. The reported elapsedMin is always the real span.
+    const cutoff = tsNow - lookbackMs;
+    let iThen = -1;
+    for (let i = iNow - 1; i >= 0; i--) {
+      if (windowUtilAt(i, name) == null) continue;
+      if (turnLog[i].ts >= cutoff) { iThen = i; }       // keep walking back to the oldest in-window
+      else { if (iThen < 0) iThen = i; break; }         // first sample past the cutoff (fallback only)
+    }
+    if (iThen < 0) return null;
+    const tsThen = turnLog[iThen].ts;
+    const utilThen = windowUtilAt(iThen, name);
+    const elapsedMin = (tsNow - tsThen) / 60000;
+    if (!(elapsedMin > 0) || utilThen == null) return null;
+    const deltaUtil = utilNow - utilThen;               // signed fraction
+    const timeImplied = elapsedMin / winMin;            // fraction of budget time alone accounts for
+    if (timeImplied <= 0) return null;
+    return { multiplier: deltaUtil / timeImplied, deltaPP: deltaUtil * 100, elapsedMin };
+  }
+  function fmtPace(p) {                                  // "1.42x time (+4.7pp / 9.8m)"
+    const sign = p.deltaPP >= 0 ? '+' : '';
+    return `${p.multiplier.toFixed(2)}x time (${sign}${p.deltaPP.toFixed(1)}pp / ${p.elapsedMin.toFixed(1)}m)`;
+  }
+
+  // ── Exact /usage burn-rate (pace) + minutes-to-cap ──────────────────────────
+  // The /usage endpoint reports usedPct (0..100), not the SSE 0..1 utilisation, and
+  // it isn't tied to turnLog — so it needs its own little time series. We keep a
+  // short, persisted history of readings per window and extrapolate from it.
+  const USAGE_HISTORY_MS = 15 * 60 * 1000;   // retain ~15 min of readings
+  function recordUsageSample(name, used) {
+    if (typeof used !== 'number') return;
+    const now = Date.now();
+    const arr = usageHistory[name] || (usageHistory[name] = []);
+    const last = arr[arr.length - 1];
+    if (!last || last.used !== used || now - last.ts > 20000) arr.push({ ts: now, used });   // skip identical spam
+    const cutoff = now - USAGE_HISTORY_MS - 60000;   // keep a little extra for a fallback baseline
+    while (arr.length > 1 && arr[0].ts < cutoff) arr.shift();
+    try { localStorage.setItem('claudeDebugUsageHist', JSON.stringify(usageHistory)); } catch (e) {}
+  }
+  // Pace + estMinsLeft for a /usage window. multiplier matches windowPace() (1.0 =
+  // on track to hit the cap exactly at reset). estMinsLeft = minutes until usedPct
+  // reaches 100 at the current NET rate (the delta already nets out aging-out), or
+  // null when flat/recovering or no baseline yet.
+  function usagePace(name, lookbackMs = PACE_LOOKBACK_MS) {
+    const winMin = windowMinutes(name);
+    const arr = usageHistory[name];
+    if (!winMin || !arr || arr.length < 2) return null;
+    const now = arr[arr.length - 1];
+    const cutoff = now.ts - lookbackMs;
+    let then = null;
+    for (let i = arr.length - 2; i >= 0; i--) {
+      if (arr[i].ts >= cutoff) then = arr[i];            // oldest reading within lookback
+      else { if (!then) then = arr[i]; break; }          // fallback: first reading just past the cutoff
+    }
+    if (!then) return null;
+    const elapsedMin = (now.ts - then.ts) / 60000;
+    if (!(elapsedMin > 0)) return null;
+    const deltaPP = now.used - then.used;                // percentage points (signed)
+    const burnPerMin = deltaPP / elapsedMin;             // pp/min (signed)
+    const timeImplied = elapsedMin / winMin;
+    const multiplier = timeImplied > 0 ? (deltaPP / 100) / timeImplied : null;
+    const remaining = 100 - now.used;
+    // Raw projection: minutes for usedPct to reach 100 at the current net burn rate.
+    // null when flat/recovering (burnPerMin <= 0) — the cap is never reached.
+    const minsToCap = burnPerMin > 0 ? Math.round(remaining / burnPerMin) : null;
+    // The window frees its quota at reset, so usable runway can never exceed the time
+    // left until reset. Use the EXACT /usage resetsAt (no-key endpoint, set by
+    // noteUsageEndpoint) as the "time left" source, and clamp:
+    //   pace > 1  -> cap arrives before reset -> estMinsLeft = minsToCap   (< minsToReset)
+    //   pace == 1 -> cap coincides with reset  -> estMinsLeft = minsToReset
+    //   pace < 1 / flat / recovering           -> reset arrives first      -> estMinsLeft = minsToReset
+    const qw = quotaWindows[name];
+    const minsToReset = (qw && Number.isFinite(qw.resetsAt))
+      ? Math.max(0, Math.round((qw.resetsAt - Date.now()) / 60000)) : null;
+    let estMinsLeft = minsToCap;
+    if (minsToReset != null) estMinsLeft = (minsToCap == null) ? minsToReset : Math.min(minsToCap, minsToReset);
+    // Which event binds (true = cap reached before reset, i.e. pace > 1).
+    const capBinds = (minsToCap != null && minsToReset != null) ? (minsToCap < minsToReset) : (minsToCap != null);
+    return { multiplier, deltaPP, elapsedMin, burnPerMin, minsToCap, minsToReset, estMinsLeft, capBinds, used: now.used };
   }
 
   const fmtBytes = b =>
@@ -436,6 +723,93 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       .then(() => console.log(okMsg))
       .catch(() => console.log(json));
   };
+
+  // Build the compact hud_audit snapshot. Shared by audit() (clipboard) and
+  // auditInject() (composer), so the two paths can never drift apart.
+  function buildAuditSnapshot() {
+    const s = window._claudeDebug.summary;
+    const data = turnLog.map(t => ({
+      rowKey: `${SESSION_NONCE}:${t.id}`,   // globally unique across reloads/pastes (id alone is not)
+      id: t.id, ts: t.ts, conv: t.conv || null, model: t.model || null,
+      isCompletion: !!t.isCompletion, isRetry: !!t.isRetry, via: t.via || 'fetch',
+      ttft: t.ttft, ttftText: t.ttftText ?? null, total: t.total, streamMs: t.streamDuration,
+      // inTok measures only the NEW turn body (claude.ai sends prior turns by UUID),
+      // NOT full reprocessed context — flagged so the reader never treats it as such.
+      inTok: t.inputTokens, inTokNewTurnOnly: true, inputApprox: !!t.inputApprox,
+      outTok: t.outputTokens,
+      thinkTok: t.thinkingChars ? estimateTokens(t.thinkingChars) : 0,
+      answerTok: t.answerChars ? estimateTokens(t.answerChars) : 0,
+      tokPerSec: t.tokPerSec, gapP95: t.interEventP95,
+      stop: t.stopReason || null, src: t.tokensReal ? 'API' : '~', status: t.status,
+    }));
+    const qWindows = quotaWindowsSnapshot();
+    return {
+      tag: 'hud_audit', schemaVersion: SCHEMA_VERSION, at: new Date().toISOString(),
+      sessionNonce: SESSION_NONCE, sessionStart: SESSION_START,
+      plan: detectedPlan,                 // free|pro|max|… or null if not seen
+      tokenSource: s.tokenSource,         // 'api' only on the keyed Anthropic API; 'estimated' on claude.ai subscriptions
+      sessionMs: s.sessionMs, chatMs: s.chatMs, engagedMs: s.engagedMs,
+      // turns = every recorded SSE stream; the counts below break that down so a
+      // ledger can do message-cap math without re-deriving it from rows.
+      turns: s.turns, completions: s.completions, retries: s.retries,
+      nonCompletionStreams: s.nonCompletionStreams, domTurns: domTurnCount(),
+      exactTurns: s.exactTurns, tokensTotal: s.tokensTotal,
+      tokensApprox: s.exactTurns === 0,   // true on any subscription account
+      charsPerToken: Number(charsPerToken().toFixed(2)), charsPerTokenCalibrated: s.calTokens > 0,
+      medianTotalMs: s.medianTotalMs, p90TotalMs: s.p90TotalMs, medianTTFTMs: s.medianTTFTMs,
+      msgsLastHour: s.msgsLastHour, msgsLast24h: s.msgsLast24h,
+      cappedAtMaxTurns: s.cappedAtMaxTurns,   // window is truncated if true
+      stopReasons: stopReasonDistribution(),
+      streamErrors: streamErrorCount,
+      quota: qWindows.length ? qWindows : latestQuota(),   // persisted rolling windows (the real subscription signal)
+      quotaWindows: qWindows,
+      data,
+    };
+  }
+
+  // Locate claude.ai's message composer (a ProseMirror contenteditable). Most
+  // specific selector first, then progressively looser fallbacks in case the
+  // markup shifts.
+  function findComposer() {
+    return document.querySelector('div.ProseMirror[contenteditable="true"]')
+        || document.querySelector('[contenteditable="true"][role="textbox"]')
+        || document.querySelector('main [contenteditable="true"]')
+        || document.querySelector('[contenteditable="true"]');
+  }
+
+  // INJECT-ONLY: insert `text` at the composer caret and stop. Never clicks Send —
+  // you review and submit by hand. Goes through execCommand('insertText') so the
+  // input flows through ProseMirror's own pipeline (a raw innerText/value set is
+  // silently dropped when you hit Send); a beforeinput event is the secondary path.
+  // If no composer is found or both inserts are rejected, the text is left on the
+  // clipboard with a console note so nothing is lost.
+  function injectIntoComposer(text, okMsg) {
+    const fallbackToClipboard = (why) =>
+      navigator.clipboard.writeText(text)
+        .then(() => console.warn(`hud_audit: ${why} — text left on clipboard instead; paste it manually.`))
+        .catch(() => console.log(text));
+    const el = findComposer();
+    if (!el) { fallbackToClipboard('composer not found'); return false; }
+    el.focus();
+    // dispatchEvent's return value is NOT a reliable "did it insert" signal (it's
+    // false only when preventDefault was called, true even when nothing changed),
+    // so verify against the actual DOM instead.
+    const sig = (text.trim().split(/\s+/)[0] || text.slice(0, 8));
+    const before = el.textContent;
+    const landed = () => el.textContent !== before && el.textContent.includes(sig);
+    try { document.execCommand('insertText', false, text); } catch (_) {}
+    if (!landed()) {
+      // last resort: a synthetic (untrusted) beforeinput; many editors ignore it,
+      // hence the DOM re-check rather than trusting the dispatch.
+      try {
+        el.dispatchEvent(new InputEvent('beforeinput',
+          { inputType: 'insertText', data: text, bubbles: true, cancelable: true }));
+      } catch (_) {}
+    }
+    if (!landed()) { fallbackToClipboard('composer did not accept the insert'); return false; }
+    console.log(okMsg);
+    return true;
+  }
 
   // Turn-log column helpers (used across stats/summary/assessment/rates).
   // col(key): finite values of one field across all turns. median(): linear-
@@ -652,6 +1026,16 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     } catch { return null; }
   }
 
+  // Organization id from any /api/organizations/<uuid>/… URL. Latched once so
+  // refreshQuota() can hit /api/organizations/<id>/usage on demand.
+  function noteOrg(rawUrl) {
+    if (orgId) return;
+    try {
+      const m = new URL(rawUrl, location.href).pathname.match(/organizations\/([0-9a-f-]{8,})/i);
+      if (m) orgId = m[1];
+    } catch { /* ignore */ }
+  }
+
   // Group key for the per-endpoint tally: the last path segment, but if that segment
   // is id-like (uuid / hex / all-digits) it's folded to "<parent>/:id" so every
   // conversation/message id doesn't become its own row. Query string is ignored.
@@ -723,9 +1107,15 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   // ─── Recording ──────────────────────────────────────────────────────────────
   function recordTurn(entry) {
     entry.ts = Date.now();
-    if (firstTurnTs == null) firstTurnTs = entry.ts;
-    lastTurnTs = entry.ts;
-    if (Number.isFinite(entry.total)) engagedMs += entry.total;
+    // Chat span + engaged time should track user-visible messages, not background
+    // SSE (title generation, etc.) or retries, so only completions advance them.
+    if (entry.isCompletion && !entry.isRetry) {
+      if (firstTurnTs == null) firstTurnTs = entry.ts;
+      lastTurnTs = entry.ts;
+      if (Number.isFinite(entry.total)) engagedMs += entry.total;
+    }
+    // Any turn that carried a message_limit refreshes the persisted quota windows.
+    if (entry.messageLimit) persistQuota(entry.messageLimit);
 
     // [SLOW]: flag turns above the session p90. Recompute the baseline every
     // SLOW_P90_REFRESH turns instead of sorting the whole log on every turn.
@@ -878,6 +1268,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
         window: label,
         messages: inWin.length,
         completions: inWin.filter(t => t.isCompletion).length,
+        freshCompletions: inWin.filter(t => t.isCompletion && !t.isRetry).length,
+        retries: inWin.filter(t => t.isRetry).length,
         exact: inWin.filter(t => t.tokensReal).length,
         inTokens: sum('inputTokens'),
         outTokens: sum('outputTokens'),
@@ -1036,6 +1428,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
 
     const id = ++reqCounter;
     const conv = convOf(url);
+    noteOrg(url);
     endpointCounts.set(endpointKey(url), (endpointCounts.get(endpointKey(url)) || 0) + 1);
     const t0 = performance.now();
     const stack = captureCallers ? callerStack() : null;   // off by default (perf); enable via _claudeDebug.callers()
@@ -1053,7 +1446,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     try {
       const { reqBytes, estInputTokens, inChars, attachments, topKeys, inputApprox, meta } = await bodyInfoP;
       const isCompletion = COMPLETION_RE.test(url);
-      const completionSeq = isCompletion ? ++completionCounter : null;   // Nth completion this session (null for non-completion calls)
+      const isRetry = RETRY_RE.test(url);
+      const completionSeq = (isCompletion && !isRetry) ? ++completionCounter : null;   // Nth FRESH completion this session (retries excluded; null for non-completion calls)
 
       console.groupCollapsed(`[REQ #${id}] ${method} ${url}`);
       console.log('  time:    ', new Date().toISOString());
@@ -1183,7 +1577,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
             const gapSorted = gaps.length ? [...gaps].sort((a, b) => a - b) : [];
             const ep = pathOf(url).split('/').pop() || '';
             recordTurn({
-              id, conv, url, endpoint: ep, isCompletion, t0, t1, t2,
+              id, conv, url, endpoint: ep, isCompletion, isRetry, via: 'fetch', t0, t1, t2,
               ttft:      t1   != null ? Math.round(t1 - t0)   : null,
               ttftEvent: tEvt != null ? Math.round(tEvt - t0) : null,
               streamDuration, total,
@@ -1283,6 +1677,12 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
             finish(`${response.status} (stream error: ${e.message})`, performance.now());
           }
         })();
+      } else if (USAGE_RE.test(url) && contentType && contentType.includes('application/json')) {
+        // No-key subscription signal: the web app already fetched this; read the
+        // plan tier and any rolling-window quota from a CLONE (page body untouched).
+        response.clone().json()
+          .then(j => { notePlanFromJson(j); if (!noteUsageEndpoint(j)) { const ml = findMessageLimit(j); if (ml) persistQuota(ml); } })
+          .catch(() => {});
       }
 
       return response; // original, untouched
@@ -1327,6 +1727,138 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) MonitoredWebSocket[k] = origWebSocket[k];
   window.WebSocket = MonitoredWebSocket;
 
+  // ─── XMLHttpRequest monitor ───────────────────────────────────────────────────
+  // Safety net for the fetch blind spot: anything claude.ai sends via XHR (now or
+  // after a future migration) would otherwise be invisible. We time monitored
+  // /api/ calls and, for SSE-style responses, record a turn by parsing the
+  // progressive responseText. CONTENT IS MEASURED, NOT LOGGED.
+  const origXhrOpen = origXHR.prototype.open;
+  const origXhrSend = origXHR.prototype.send;
+  function installXhrMonitor() {
+    origXHR.prototype.open = function (method, url, ...rest) {
+      this.__cdMethod = String(method || 'GET').toUpperCase();
+      this.__cdUrl = url;
+      return origXhrOpen.call(this, method, url, ...rest);
+    };
+    origXHR.prototype.send = function (body) {
+      const url = this.__cdUrl;
+      if (!url || !isMonitoredApi(url)) return origXhrSend.call(this, body);
+
+      const id = ++reqCounter;
+      const conv = convOf(url);
+      noteOrg(url);
+      endpointCounts.set(endpointKey(url), (endpointCounts.get(endpointKey(url)) || 0) + 1);
+      const t0 = performance.now();
+      const isCompletion = COMPLETION_RE.test(url);
+      const isRetry = RETRY_RE.test(url);
+      const reqBytes = typeof body === 'string' ? byteLen(body) : null;
+      const parsedBody = typeof body === 'string' ? tryParse(body) : null;
+      const inChars = typeof body === 'string'
+        ? (parsedBody ? extractStringChars(parsedBody, { attachments: 0 }) : body.length) : null;
+      const estInputTokens = inChars != null ? estimateTokens(inChars) : null;
+      const meta = requestMeta(parsedBody);
+
+      pendingRequests.set(id, { id, url, method: this.__cdMethod, start: t0 });
+      maxInFlight = Math.max(maxInFlight, pendingRequests.size);
+
+      let t1 = null, tEvt = null, lastLen = 0, events = 0, answerChars = 0, thinkingChars = 0;
+      let stopReason = null, messageLimit = null, streamError = null, recorded = false;
+      let realIn = null, realOut = null, cacheRead = null, cacheCreate = null;
+
+      // Parse only the bytes that arrived since the last progress tick (XHR keeps
+      // the full responseText, so we slice forward — no re-parsing).
+      const parseForward = txt => {
+        if (typeof txt !== 'string' || txt.length <= lastLen) return;
+        const slice = txt.slice(lastLen); lastLen = txt.length;
+        let from = 0, nl;
+        while ((nl = slice.indexOf('\n', from)) >= 0) {
+          const line = slice.slice(from, nl); from = nl + 1;
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload || payload === '[DONE]') continue;
+          const obj = tryParse(payload);
+          if (!obj || isPingEvent(obj)) continue;
+          if (tEvt == null) tEvt = performance.now();
+          events++;
+          const u = usageFromEvent(obj);
+          if (u) {
+            if (Number.isFinite(u.input_tokens)) realIn = u.input_tokens;
+            if (Number.isFinite(u.output_tokens)) realOut = u.output_tokens;
+            if (Number.isFinite(u.cache_read_input_tokens)) cacheRead = u.cache_read_input_tokens;
+            if (Number.isFinite(u.cache_creation_input_tokens)) cacheCreate = u.cache_creation_input_tokens;
+          }
+          const sr = (obj.delta && obj.delta.stop_reason) || obj.stop_reason;
+          if (sr) stopReason = sr;
+          if (obj.type === 'message_limit') messageLimit = (obj.message_limit && typeof obj.message_limit === 'object') ? obj.message_limit : obj;
+          if (obj.type === 'error') streamError = obj.error || obj;
+          const n = outputCharsFromEvent(obj);
+          if (n > 0) answerChars += n; else if (n < 0) thinkingChars -= n;
+        }
+      };
+
+      const finishXhr = status => {
+        if (recorded) return;
+        recorded = true;
+        clearInterval(hb);
+        pendingRequests.delete(id);
+        const t2 = performance.now();
+        statusCounts.set(status, (statusCounts.get(status) || 0) + 1);
+        const outChars = answerChars + thinkingChars;
+        const estOutputTokens = estimateTokens(outChars);
+        const inputTokens  = realIn  != null ? realIn  : estInputTokens;
+        const outputTokens = realOut != null ? realOut : estOutputTokens;
+        const tokensReal   = realIn != null || realOut != null;
+        if (realIn != null && realIn > 0 && Number.isFinite(inChars) && inChars > 0) { calChars += inChars; calTokens += realIn; }
+        if (streamError) streamErrorCount++;
+        const total = Math.round(t2 - t0);
+        const streamDuration = t1 != null ? Math.round(t2 - t1) : null;
+        const ep = pathOf(url).split('/').pop() || '';
+        recordTurn({
+          id, conv, url, endpoint: ep, isCompletion, isRetry, via: 'xhr', t0, t1, t2,
+          ttft:      t1   != null ? Math.round(t1 - t0)   : null,
+          ttftEvent: tEvt != null ? Math.round(tEvt - t0) : null,
+          streamDuration, total, reads: 0, events,
+          reqBytes, inChars, attachments: 0,
+          estInputTokens, estOutputTokens,
+          inputTokens, outputTokens, tokensReal,
+          cacheRead, cacheCreate, streamBytes: null,
+          tokPerSec:     (streamDuration && streamDuration > 0 && outputTokens != null) ? Math.round(outputTokens / (streamDuration / 1000)) : null,
+          tokPerSecWall: (total > 0 && outputTokens != null) ? Math.round(outputTokens / (total / 1000)) : null,
+          interEventP50: null, interEventP95: null,
+          answerChars, thinkingChars,
+          ttftText: null, ttftThink: null, reasonedMs: null,
+          thinkingShare: (answerChars + thinkingChars) > 0 ? +(thinkingChars / (answerChars + thinkingChars)).toFixed(2) : null,
+          answerTok: estimateTokens(answerChars), answerTokPerSec: null,
+          stopReason, stopDetails: null, messageLimit, streamError, compaction: null,
+          model: meta.model, thinkingMode: meta.thinkingMode, effort: meta.effort,
+          toolCount: meta.toolCount, attachmentCount: meta.attachmentCount, syncSources: meta.syncSources,
+          inputApprox: true, status,
+        });
+        // Non-SSE usage/account XHR: read plan + quota, no key needed.
+        if (!events && USAGE_RE.test(url)) {
+          try { const j = JSON.parse(this.responseText); notePlanFromJson(j); if (!noteUsageEndpoint(j)) { const ml = findMessageLimit(j); if (ml) persistQuota(ml); } } catch (_) {}
+        }
+      };
+
+      const markTtft = () => { if (t1 == null && this.readyState >= origXHR.LOADING) t1 = performance.now(); };
+      this.addEventListener('readystatechange', () => { markTtft(); if (this.readyState === origXHR.LOADING) { try { parseForward(this.responseText); } catch (_) {} } });
+      this.addEventListener('progress', () => { markTtft(); try { parseForward(this.responseText); } catch (_) {} });
+      this.addEventListener('load',  () => { try { parseForward(this.responseText); } catch (_) {} finishXhr(this.status); });
+      this.addEventListener('error', () => { failCount++; finishXhr(0); });
+      this.addEventListener('abort', () => finishXhr(this.status || 0));
+
+      const hb = setInterval(() => {
+        if (!pendingRequests.has(id)) { clearInterval(hb); return; }
+        const elapsed = performance.now() - t0;
+        const warnAt = SLOW_ENDPOINT_RE.test(url) ? HANG_SLOW_WARN_MS : HANG_WARN_MS;
+        if (elapsed >= warnAt) console.warn(`[HANG #${id}] (xhr) still pending after ${(elapsed / 1000).toFixed(1)}s — ${url}`);
+      }, HANG_INTERVAL_MS);
+
+      return origXhrSend.call(this, body);
+    };
+  }
+  installXhrMonitor();
+
   // ─── Browser-level events ─────────────────────────────────────────────────────
   const onVisibility = () =>
     console.log(`[TAB] visibility → ${document.visibilityState}, pending: ${pendingRequests.size}`);
@@ -1366,6 +1898,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     stats: () => printStats(),
     histogram: (metric = 'total', buckets = 5) => printHistogram(metric, buckets),
     histogramHud: (metric = 'total') => renderHistHud(metric),
+    paceHud: () => renderPaceHud(),
     rates: () => printRates(),
     byConversation: () => byConversation(),
     endpoints: () => {
@@ -1391,11 +1924,45 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       console.log('Most recent rate-limit headers:', lastRateLimit);
     },
 
+    // Subscription consumption (no API key): persisted rolling-window quota, the
+    // metric Free/Pro/Max are actually metered on. Survives reloads via localStorage.
+    quota: () => {
+      const w = quotaWindowsSnapshot();
+      if (!w.length) { console.log('No message_limit windows captured yet (send a message, or open a usage view).'); return; }
+      console.table(w.map(x => ({
+        window: x.window,
+        used: x.usedPct != null ? `${x.usedPct}%` : '?',
+        left: x.usedPct != null ? `${100 - x.usedPct}%` : '?',
+        status: x.status || '',
+        resetsIn: x.resetsInMs != null ? fmtDur(x.resetsInMs) : '?',
+        pace: x.paceMultiplier != null ? `${x.paceMultiplier}x` : '',
+        estMinsLeft: x.estMinsLeft != null ? `${x.estMinsLeft}m` : '',
+      })));
+      console.log('plan:', detectedPlan || 'unknown');
+    },
+    plan: () => { console.log('Detected plan:', detectedPlan || 'unknown (no usage/account response seen yet)'); return detectedPlan; },
+
+    // Actively fetch /api/organizations/<id>/usage (the exact-quota endpoint the
+    // web app uses) and refresh the persisted windows. No key — rides the page's
+    // own session cookies. Uses origFetch so it isn't re-instrumented.
+    refreshQuota: async () => {
+      if (!orgId) { console.log('Org id not seen yet — send a message (or open a chat) first, then retry.'); return null; }
+      const j = await fetchUsage();
+      if (j && noteUsageEndpoint(j)) window._claudeDebug.quota();
+      else console.log('refreshQuota: no active windows in payload (or fetch failed).');
+      return j;
+    },
+    domTurns: () => { const n = domTurnCount(); console.log('Rendered assistant turns (heuristic DOM count):', n, '· completions recorded:', window._claudeDebug.summary.completions); return n; },
+
     health: () => {
       console.group('\ud83e\ude7a Health');
       console.log('peak in-flight: ', maxInFlight, ' · current:', pendingRequests.size);
       console.log('fetch failures: ', failCount);
       console.log('status counts:  ', Object.fromEntries(statusCounts));
+      console.log('plan:           ', detectedPlan || 'unknown');
+      { const d = domTurnCount(), c = window._claudeDebug.summary.completions;
+        console.log('completions/DOM:', `${c} recorded vs ${d == null ? '?' : d} rendered`,
+          (d != null && Math.abs(d - c) > 1) ? '\u26a0 divergence — traffic may be escaping the fetch/XHR patches' : ''); }
       if (lastRateLimit) console.log('last rate-limit:', lastRateLimit);
       console.groupEnd();
     },
@@ -1469,37 +2036,26 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     // a slim per-turn array (incl. the new thinking/answer/stop/model fields). Copy
     // it and paste to Claude with the keyword "hud_audit" to track trends over time.
     audit: () => {
-      const s = window._claudeDebug.summary;
-      const data = turnLog.map(t => ({
-        id: t.id, ts: t.ts, conv: t.conv || null, model: t.model || null,
-        ttft: t.ttft, ttftText: t.ttftText ?? null, total: t.total, streamMs: t.streamDuration,
-        inTok: t.inputTokens, outTok: t.outputTokens,
-        thinkTok: t.thinkingChars ? estimateTokens(t.thinkingChars) : 0,
-        answerTok: t.answerChars ? estimateTokens(t.answerChars) : 0,
-        tokPerSec: t.tokPerSec, gapP95: t.interEventP95,
-        stop: t.stopReason || null, src: t.tokensReal ? 'API' : '~', status: t.status,
-      }));
-      const snapshot = {
-        tag: 'hud_audit', at: new Date().toISOString(),
-        sessionMs: s.sessionMs, chatMs: s.chatMs, engagedMs: s.engagedMs,
-        turns: s.turns, exactTurns: s.exactTurns, tokensTotal: s.tokensTotal,
-        medianTotalMs: s.medianTotalMs, p90TotalMs: s.p90TotalMs, medianTTFTMs: s.medianTTFTMs,
-        msgsLastHour: s.msgsLastHour, msgsLast24h: s.msgsLast24h,
-        charsPerToken: Number(charsPerToken().toFixed(2)),
-        quota: latestQuota(),
-        streamErrors: streamErrorCount,
-        data,
-      };
-      copyJson(snapshot, `hud_audit snapshot copied (${data.length} turns) — paste to Claude with "hud_audit".`);
+      const snapshot = buildAuditSnapshot();
+      copyJson(snapshot, `hud_audit snapshot copied (${snapshot.data.length} turns) — paste to Claude with "hud_audit".`);
+    },
+
+    // Same snapshot as audit(), but injected straight into the chat composer with
+    // the `hud_audit` keyword already prefixed. INJECT-ONLY: it never presses Send,
+    // so you review the payload and submit it yourself.
+    auditInject: () => {
+      const snapshot = buildAuditSnapshot();
+      const payload = `hud_audit\n\n${JSON.stringify(snapshot, null, 2)}`;
+      injectIntoComposer(payload, `hud_audit snapshot (${snapshot.data.length} turns) injected into the composer — review, then press Send.`);
     },
 
     help: () => {
       const g = (t, items) => { console.group(t); items.forEach(i => console.log(i)); console.groupEnd(); };
       console.group('%c\ud83d\udee0 _claudeDebug commands', 'font-weight:bold');
       g('Reports', ['report() \u2014 summary + rates + histogram', 'rates() \u2014 1m/5m/1h/24h messages/tokens/bytes', 'byConversation() \u2014 per-conversation totals', 'endpoints() \u2014 per-endpoint request tally', 'turns() \u2014 per-turn table', 'stats() \u2014 TTFT/stream/total min/median/p90/max', 'health() \u2014 in-flight/fails/status', 'rateLimits() \u2014 last rate-limit headers']);
-      g('Visuals (on-page)', ['hud() \u2014 toggle overlay', 'histogramHud() \u2014 histogram panel (cycles metric)', 'histogram(metric?) \u2014 histogram to console']);
-      g('Diagnostics', ['probe() \u2014 arm schema probe (\ud83d\udd2c)', 'assess() \u2014 outliers & efficiency (\ud83d\udca1)', 'time() \u2014 session/chat/engaged/idle', 'calibration() \u2014 current chars/token', 'callers(on?) \u2014 toggle per-request caller capture']);
-      g('Data', ['data \u2014 turn array (getter)', 'summary \u2014 key metrics (getter)', 'export() \u2014 full turn JSON to clipboard', 'audit() \u2014 compact hud_audit snapshot (\ud83e\uddfe)', 'pending() \u2014 in-flight requests', 'sockets() \u2014 WebSocket activity']);
+      g('Visuals (on-page)', ['hud() \u2014 toggle overlay', 'histogramHud() \u2014 histogram panel (cycles metric)', 'paceHud() \u2014 pace tachometer (5h pace vs time)', 'histogram(metric?) \u2014 histogram to console']);
+      g('Diagnostics', ['probe() \u2014 arm schema probe (\ud83d\udd2c)', 'assess() \u2014 outliers & efficiency (\ud83d\udca1)', 'quota() \u2014 subscription rolling-window usage (no key)', 'refreshQuota() \u2014 actively fetch the exact usage endpoint', 'plan() \u2014 detected tier', 'domTurns() \u2014 DOM vs recorded completion cross-check', 'time() \u2014 session/chat/engaged/idle', 'calibration() \u2014 current chars/token', 'callers(on?) \u2014 toggle per-request caller capture']);
+      g('Data', ['data \u2014 turn array (getter)', 'summary \u2014 key metrics (getter)', 'export() \u2014 full turn JSON to clipboard', 'audit() \u2014 compact hud_audit snapshot to clipboard (\ud83e\uddfe)', 'auditInject() \u2014 inject hud_audit snapshot + keyword into the chat box, no send (\ud83d\udce8)', 'pending() \u2014 in-flight requests', 'sockets() \u2014 WebSocket activity']);
       g('Control', ['reset() \u2014 clear turns + chat clocks', 'resetAll() \u2014 clear everything but session clock', 'stop() \u2014 restore fetch/WebSocket, remove overlays']);
       console.groupEnd();
     },
@@ -1509,6 +2065,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       destroyResultHud();
       window.fetch = origFetch;
       window.WebSocket = origWebSocket;
+      origXHR.prototype.open = origXhrOpen;
+      origXHR.prototype.send = origXhrSend;
       perfObs?.disconnect();
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('online', onOnline);
@@ -1531,9 +2089,14 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       const exactTurns = turnLog.filter(t => t.tokensReal).length;
       const now = Date.now();
       const rs = ratesSnapshot();                       // shared (memoized) window buckets
-      const win = label => { const r = rs.find(x => x.window === label); return r ? r.messages : 0; };
+      // "Messages" should mean user-visible turns, so count fresh completions
+      // (excludes background SSE and retries), not raw turn rows.
+      const winMsgs = label => { const r = rs.find(x => x.window === label); return r ? r.freshCompletions : 0; };
       return {
         turns:         turnLog.length,
+        completions:   turnLog.filter(t => t.isCompletion && !t.isRetry).length,
+        retries:       turnLog.filter(t => t.isRetry).length,
+        nonCompletionStreams: turnLog.filter(t => !t.isCompletion).length,
         inFlight:      pendingRequests.size,
         lastTotalMs:   totals.length ? totals[totals.length - 1] : null,
         medianTotalMs: st ? st.median : null,
@@ -1541,11 +2104,15 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
         medianTTFTMs:  tt ? tt.median : null,
         tokensTotal,
         exactTurns,
+        tokenSource:   exactTurns > 0 ? 'api' : 'estimated',
+        plan:          detectedPlan,
+        calChars, calTokens,
+        cappedAtMaxTurns: turnLog.length >= MAX_TURNS,
         sessionMs:     now - SESSION_START,
         chatMs:        (firstTurnTs != null && lastTurnTs != null) ? lastTurnTs - firstTurnTs : 0,
         engagedMs,
-        msgsLastHour:  win('1h'),
-        msgsLast24h:   win('24h'),
+        msgsLastHour:  winMsgs('1h'),
+        msgsLast24h:   winMsgs('24h'),
       };
     },
   };
@@ -1624,17 +2191,22 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     hudTitle = document.createElement('span');
     css(hudTitle, { fontWeight: 'bold', color: '#cdbcff' });
     const btns = document.createElement('span');
-    btns.appendChild(mkBtn('📊', 'Show histogram panel (click to cycle metric)', () => {
+    // Hide/close (×) lives at the FAR LEFT, set apart by a gap, so it is never
+    // fat-fingered while toggling expand/collapse (▾) at the far right.
+    const closeBtn = mkBtn('×', 'Hide overlay (re-show with _claudeDebug.hud())', () => toggleHud(false));
+    css(closeBtn, { marginRight: '10px' });
+    btns.appendChild(closeBtn);
+    btns.appendChild(mkBtn('\uD83D\uDCCA', 'Show histogram panel (click to cycle metric)', () => {
       const metric = HUD_HIST_METRICS[hudHistIdx % HUD_HIST_METRICS.length];
       hudHistIdx++;
       renderHistHud(metric);
     }));
+    btns.appendChild(mkBtn('\uD83C\uDF9B\uFE0F', 'Show pace tachometer (5h pace vs time; red = over 1\u00d7 redline, green = under)', () => renderPaceHud()));
     btns.appendChild(mkBtn('🔬', 'Arm schema probe — analyzes the next turn and reports problems in the console', () => runSchemaProbe()));
     btns.appendChild(mkBtn('💡', 'Assess — outliers, efficiency & recommendations in the console', () => runAssessment()));
     btns.appendChild(mkBtn('⧉', 'Copy turn data as JSON', () => window._claudeDebug.export()));
-    btns.appendChild(mkBtn('🧾', 'Copy a hud_audit snapshot to the clipboard (then paste it to Claude)', () => window._claudeDebug.audit()));
+    btns.appendChild(mkBtn('📨', 'Inject a hud_audit snapshot + keyword into the chat box (review, then press Send yourself)', () => window._claudeDebug.auditInject()));
     btns.appendChild(mkBtn('▾', 'Collapse / expand', () => setCollapsed(!hudCollapsed)));
-    btns.appendChild(mkBtn('×', 'Hide overlay (re-show with _claudeDebug.hud())', () => toggleHud(false)));
     header.appendChild(hudTitle);
     header.appendChild(btns);
     header.addEventListener('click', () => { if (header.__dragged) { header.__dragged = false; return; } setCollapsed(!hudCollapsed); });
@@ -1670,6 +2242,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   function updateHud() {
     if (!hudRoot) return;
     if (typeof document !== 'undefined' && document.hidden) return;   // no work in a backgrounded tab
+    if (paceRoot) renderPaceHud();   // keep the tachometer live while it's open (independent of collapse)
     if (hudCollapsed) {
       let _tt = 0, _ex = 0;                                           // cheap pill: no sorts, single pass
       for (const _t of turnLog) {
@@ -1678,39 +2251,124 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
         if (_t.tokensReal) _ex++;
       }
       const s = { turns: turnLog.length, exactTurns: _ex, tokensTotal: _tt };
-      hudTitle.textContent = `⏱ ${s.turns} turns · ${s.turns && s.exactTurns === s.turns ? '' : '~'}${s.tokensTotal} tok`;
+      const _pre = s.turns && s.exactTurns === s.turns ? '' : '~';
+      const _q5 = quotaWindows['5h'];
+      const _q5txt = (_q5 && _q5.usedPct != null) ? ` · 5h ${_q5.usedPct}%` : '';
+      hudTitle.textContent = `⏱ ${s.turns} turns · ${_pre}${s.tokensTotal} tok${_q5txt}`;
       return;
     }
     const s = window._claudeDebug.summary;
     const oneH = ratesSnapshot().find(r => r.window === '1h') || { messages: 0, inTokens: 0, outTokens: 0 };
     hudTitle.textContent = 'Claude Debug';
     const oneHTok = oneH.inTokens + oneH.outTokens;
+
+    // Keep the exact /usage windows current while the HUD is open+visible: refresh
+    // at most once per QUOTA_POLL_MS (the reset countdowns below tick live every
+    // second regardless, since they recompute from the stored reset epoch).
+    if (orgId && Date.now() - lastQuotaPollAt > QUOTA_POLL_MS) { lastQuotaPollAt = Date.now(); fetchUsage(); }
+
+    // EXACT subscription usage from /api/.../usage (no key) — its own labelled set
+    // of lines, separate from the SSE message_limit block below. 5h and 7d first.
+    const usageWins = quotaWindowsSnapshot();
+    const usageLines = [];
+    if (usageWins.length) {
+      const ord = { '5h': 0, '7d': 1 };
+      usageWins.sort((a, b) => (ord[a.window] ?? 9) - (ord[b.window] ?? 9) || a.window.localeCompare(b.window));
+      usageLines.push('── usage (exact, no key) ──');
+      for (const w of usageWins) {
+        const reset = (w.resetsInMs != null && w.resetsInMs > 0) ? `resets in ${fmtDur(w.resetsInMs)}` : (w.status || 'reset due');
+        const used = w.usedPct != null ? `${w.usedPct}% used` : (w.status || '?');
+        usageLines.push(`${w.window}`.padEnd(13) + `${used} · ${reset}`);
+        if (w.window === '5h') {
+          const p = usagePace('5h');                     // burn rate from the persisted /usage history
+          if (p && p.multiplier != null) usageLines.push('5h pace'.padEnd(13) + fmtPace(p));
+          if (p && p.estMinsLeft != null) {
+            // estMinsLeft is already clamped to the reset; label which event binds.
+            const label = p.capBinds ? 'to cap' : 'to reset';
+            usageLines.push('5h estMins'.padEnd(13) + `${p.estMinsLeft}m ${label}`);
+          } else if (p) {
+            usageLines.push('5h estMins'.padEnd(13) + (p.burnPerMin <= 0 ? 'flat/recovering' : 'n/a'));
+          }
+        }
+        if (w.window === '7d') {
+          // Same machinery as 5h, but over the 7-day window, and reported in
+          // fractional DAYS (2dp) rather than minutes. usagePace() already clamps
+          // estMinsLeft = min(minsToCap, minsToReset), so estDays can NEVER exceed
+          // the days left before the 7d window resets. Label which event binds,
+          // exactly like the 5h estMins line ('to cap' vs 'to reset').
+          const p = usagePace('7d');
+          if (p && p.multiplier != null) usageLines.push('7d pace'.padEnd(13) + fmtPace(p));
+          if (p && p.estMinsLeft != null) {
+            const label = p.capBinds ? 'to cap' : 'to reset';
+            const estDays = (p.estMinsLeft / 1440).toFixed(2);
+            usageLines.push('7d estDays'.padEnd(13) + `${estDays}d ${label}`);
+          } else if (p) {
+            usageLines.push('7d estDays'.padEnd(13) + (p.burnPerMin <= 0 ? 'flat/recovering' : 'n/a'));
+          }
+        }
+      }
+    }
+
     const _q = latestQuota();
-    // Each usage window (5h, 7d, …) gets its OWN line, labelled "<window> quota"
-    // (e.g. "5h quota", "7d quota"), so a long window value never bleeds past the
-    // 340px box (whiteSpace:'pre' = no auto-wrap). The overage flag, having no
-    // window of its own, sits on a trailing indented line.
+    // Each SSE message_limit window (5h, 7d, …) gets its OWN line, labelled
+    // "<window> quota", so a long value never bleeds past the 340px box
+    // (whiteSpace:'pre' = no auto-wrap). The overage flag sits on a trailing line.
     const quotaLines = [];
     if (_q) {
       const QPAD = '             ';   // 13 spaces = value column (matches label width)
       for (const w of _q.windows) {
         quotaLines.push(`${w.name} quota`.padEnd(13) + fmtQuotaWindow(w));
+        if (w.name === '5h') {
+          const p = windowPace('5h');           // rate of 5h utilisation vs clock, last ~10 min
+          if (p) quotaLines.push('5h pace'.padEnd(13) + fmtPace(p));
+        }
       }
       if (_q.overageInUse) quotaLines.push(`${QPAD}OVERAGE ON`);
       else if (_q.overageDisabledReason) quotaLines.push(`${QPAD}overage off (${_q.overageDisabledReason})`);
     }
-    hudBody.textContent = [
+    // timeLeft1x = minutes left in the 5h window at a steady 1x (or slower) pace.
+    // Anchored to the EXACT reset from /usage (quotaWindows['5h'].resetsAt) so it
+    // matches the same clock estMins is clamped to — hence estMins ≤ timeLeft1x holds
+    // exactly. Falls back to (5h − session time) only if the endpoint hasn't yet
+    // reported a 5h reset. If est is strictly smaller you are burning above 1x (cap
+    // sooner) → RED + show estMins; otherwise show timeLeft1x → GREEN. Whole minutes.
+    const FIVE_H_MIN = 300;
+    const _q5w = quotaWindows['5h'];
+    const reset5Min = (_q5w && Number.isFinite(_q5w.resetsAt))
+      ? Math.max(0, Math.round((_q5w.resetsAt - Date.now()) / 60000)) : null;
+    const timeLeft1x = (reset5Min != null) ? reset5Min : Math.max(0, Math.round(FIVE_H_MIN - s.sessionMs / 60000));
+    const _p5 = usagePace('5h');
+    const est5 = (_p5 && _p5.estMinsLeft != null) ? _p5.estMinsLeft : null;
+    const paceLine = (est5 != null && est5 < timeLeft1x)
+      ? { t: 'estMins'.padEnd(13)    + `${est5}m  (< timeLeft1x ${timeLeft1x}m \u2014 above 1x pace)`, c: '#ff6b6b' }
+      : { t: 'timeLeft1x'.padEnd(13) + `${timeLeft1x}m`, c: '#5cdd7b' };
+
+    const bodyItems = [
       `turns        ${s.turns}   (in-flight ${s.inFlight})`,
       `time         session ${fmtDur(s.sessionMs)} · chat ${fmtDur(s.chatMs)}`,
       `             gen ${fmtDur(s.engagedMs)} / idle ${fmtDur(Math.max(0, s.chatMs - s.engagedMs))}`,
+      paceLine,
       `total        med ${fmtMs(s.medianTotalMs)} / p90 ${fmtMs(s.p90TotalMs)}`,
       `TTFT         med ${fmtMs(s.medianTTFTMs)}`,
       `tokens       ${s.turns && s.exactTurns === s.turns ? '' : '~'}${s.tokensTotal}  (in+out; ${s.exactTurns}/${s.turns} exact)`,
       `last 1h      ${oneH.messages} msgs · ~${oneHTok} tok`,
       `last 24h     ${s.msgsLast24h} msgs`,
+      ...usageLines,
       ...quotaLines,
       `~ / day      ~${oneH.messages * 24} msgs · ~${oneHTok * 24} tok`,
-    ].join('\n');
+    ];
+    // One <div> per line so a single line can be coloured (a joined textContent
+    // string can't). Parent is white-space:pre + monospace, so padEnd alignment
+    // and leading spaces are preserved; each div's text is set via textContent
+    // (no HTML, no escaping concerns). A plain string item is an uncoloured line.
+    hudBody.textContent = '';
+    for (const it of bodyItems) {
+      const ln = (typeof it === 'string') ? { t: it } : it;
+      const d = document.createElement('div');
+      d.textContent = ln.t;
+      if (ln.c) d.style.color = ln.c;
+      hudBody.appendChild(d);
+    }
     hudFoot.textContent = `~ = est (chars/${charsPerToken().toFixed(2)}); no ~ = exact from stream`;
   }
 
@@ -1858,6 +2516,85 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     });
   }
 
+  // ─── Pace tachometer panel (5h pace vs time, SVG) ───────────────────────────
+  function ensurePaceHud() {
+    if (paceRoot) return;
+    const p = makePanel('right');
+    paceRoot = p.root; paceTitle = p.title; paceBody = p.body;
+    css(paceRoot, { maxWidth: '340px', padding: '8px', userSelect: 'none' });
+    css(p.head, { marginBottom: '6px' });
+    css(paceTitle, { fontWeight: 'bold', color: '#cdbcff' });
+    p.head.appendChild(mkBtn('×', 'Close tachometer', () => destroyPaceHud()));
+    (document.body || document.documentElement).appendChild(paceRoot);
+    // sit below the main HUD if visible (set once at creation, like the hist panel)
+    if (hudRoot && hudRoot.getBoundingClientRect) {
+      const r = hudRoot.getBoundingClientRect();
+      if (r.height) paceRoot.style.top = Math.round(r.bottom + 8) + 'px';
+    }
+  }
+  function destroyPaceHud() {
+    if (paceRoot && paceRoot.parentNode) paceRoot.parentNode.removeChild(paceRoot);
+    paceRoot = paceTitle = paceBody = null;
+  }
+  function renderPaceHud() {
+    whenBody(() => {
+      ensurePaceHud();
+      const RED = '#f85149', GREEN = '#3fb950', GRID = 'rgba(255,255,255,0.15)', REDLINE = '#d29922';
+      const pts = (paceLog['5h'] || []).filter(p => p && Number.isFinite(p.mult));
+      paceTitle.textContent = '\uD83C\uDF9B\uFE0F 5h pace \u00b7 tachometer';
+      paceBody.innerHTML = '';
+      if (pts.length < 2) {
+        const d = document.createElement('div');
+        d.textContent = 'Revving up\u2026 keep the HUD open; it samples /usage ~1\u00d7/min. Need 2+ points.';
+        css(d, { color: '#cdbcff', maxWidth: '300px', whiteSpace: 'normal' });
+        paceBody.appendChild(d);
+        return;
+      }
+      // geometry — fixed 0..4x dial (like a real tachometer), so the needle height
+      // is comparable across renders and the 1x redline sits at a constant place.
+      const WHITE = '#ffffff';
+      const W = 312, H = 150, m = { l: 34, r: 10, t: 10, b: 22 };
+      const t0 = pts[0].ts, t1 = pts[pts.length - 1].ts, span = Math.max(1, t1 - t0);
+      const maxM = 4;
+      const X = t => m.l + (W - m.l - m.r) * ((t - t0) / span);
+      const Y = v => m.t + (H - m.t - m.b) * (1 - Math.min(Math.max(v, 0), maxM) / maxM);
+      let svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
+      svg += `<line x1="${m.l}" y1="${m.t}" x2="${m.l}" y2="${H - m.b}" stroke="${GRID}"/>`;
+      svg += `<line x1="${m.l}" y1="${H - m.b}" x2="${W - m.r}" y2="${H - m.b}" stroke="${GRID}"/>`;
+      // y-axis gridlines + labels at the requested marks (1.0 is drawn below as the redline)
+      const TICKS = [0, 0.5, 1, 1.5, 2, 3, 4];
+      for (const tk of TICKS) {
+        const yy = Y(tk);
+        if (tk !== 1) svg += `<line x1="${m.l}" y1="${yy.toFixed(1)}" x2="${W - m.r}" y2="${yy.toFixed(1)}" stroke="${GRID}"/>`;
+        svg += `<text x="${m.l - 4}" y="${(yy + 3).toFixed(1)}" fill="${WHITE}" font-size="8" text-anchor="end">${tk.toFixed(1)}</text>`;
+      }
+      // the 1.0x "redline" — prominent (solid amber, thicker) so it reads clearly
+      // against the white trace; above it you burn faster than the clock.
+      const y1 = Y(1);
+      svg += `<line x1="${m.l}" y1="${y1.toFixed(1)}" x2="${W - m.r}" y2="${y1.toFixed(1)}" stroke="${REDLINE}" stroke-width="1.5"/>`;
+      svg += `<text x="${W - m.r}" y="${(y1 - 3).toFixed(1)}" fill="${REDLINE}" font-size="9" text-anchor="end">1.0\u00d7 redline</text>`;
+      // trace segments coloured by the newer endpoint (over the redline = red,
+      // under = green); per-reading dots are coloured the same. y-axis labels are
+      // white (set above) so the scale reads clearly against the coloured trace.
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1], b = pts[i], col = b.mult > 1 ? RED : GREEN;
+        svg += `<line x1="${X(a.ts).toFixed(1)}" y1="${Y(a.mult).toFixed(1)}" x2="${X(b.ts).toFixed(1)}" y2="${Y(b.mult).toFixed(1)}" stroke="${col}" stroke-width="1.5"/>`;
+      }
+      for (const p of pts) {
+        const col = p.mult > 1 ? RED : GREEN;
+        svg += `<circle cx="${X(p.ts).toFixed(1)}" cy="${Y(p.mult).toFixed(1)}" r="2.4" fill="${col}"/>`;
+      }
+      svg += `</svg>`;
+      paceBody.innerHTML = svg;
+      // caption: current RPM + plain-language verdict
+      const cur = pts[pts.length - 1].mult, spanMin = Math.round(span / 60000);
+      const cap = document.createElement('div');
+      cap.textContent = `now ${cur.toFixed(2)}\u00d7 \u00b7 ${cur > 1 ? '\uD83D\uDD34 over redline (cap before reset)' : '\uD83D\uDFE2 under 1\u00d7 (reach reset with quota to spare)'} \u00b7 last ${spanMin}m, ${pts.length} pts`;
+      css(cap, { marginTop: '4px', fontSize: '11px', color: cur > 1 ? RED : GREEN, whiteSpace: 'normal', maxWidth: '300px' });
+      paceBody.appendChild(cap);
+    });
+  }
+
   function whenBody(fn) {
     if (document.body) fn();
     else document.addEventListener('DOMContentLoaded', fn, { once: true });
@@ -1882,10 +2619,125 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
 EOF
 
 echo "  wrote claude_developer_debug.js"
+
+# ─── package the unpacked folder into a local .zip (+ .xpi) ───────────────────
+# Runs on every execution so you always get a distributable archive next to the
+# folder. Prefers web-ext (proper MV3 packaging); falls back to `zip`, then to
+# python's zipfile, so the archive is produced even without npm/web-ext.
+ZIPDIR="web-ext-artifacts"
+mkdir -p "$ZIPDIR"
+VER="$(grep -o '"version"[^,]*' "$EXTDIR/manifest.json" | grep -o '[0-9][0-9.]*' || true)"
+VER="${VER:-1.0}"
+ZIP=""
+if command -v web-ext >/dev/null 2>&1; then
+  echo "  packaging with web-ext..."
+  if web-ext build --source-dir "$EXTDIR" --artifacts-dir "$ZIPDIR" --overwrite-dest >/dev/null 2>&1; then
+    ZIP="$(ls -t "$ZIPDIR"/*.zip 2>/dev/null | head -1 || true)"
+  fi
+fi
+if [ -z "$ZIP" ]; then
+  [ -x "$(command -v web-ext || true)" ] || echo "  web-ext not available — using a plain zip fallback"
+  ZIP="$ZIPDIR/claude_developer_debug-${VER}.zip"
+  rm -f "$ZIP"
+  if command -v zip >/dev/null 2>&1; then
+    ( cd "$EXTDIR" && zip -q -r -X "../$ZIP" . )
+  else
+    python3 - "$EXTDIR" "$ZIP" <<'PY'
+import os, sys, zipfile
+src, out = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+    for root, _, files in os.walk(src):
+        for f in files:
+            full = os.path.join(root, f)
+            z.write(full, os.path.relpath(full, src))
+PY
+  fi
+fi
+# an .xpi is just the zip renamed; Firefox's "Install Add-on From File" wants .xpi
+XPI="${ZIP%.zip}.xpi"
+cp -f "$ZIP" "$XPI"
+echo "  built package: $ZIP"
+echo "  built package: $XPI  (identical bytes; .xpi is for Firefox file-install)"
 echo ""
-echo "Done. Extension folder ready at: $EXTDIR/"
-echo ""
-echo "Chrome 111+:   chrome://extensions  →  Developer mode ON  →  Load unpacked  →  select $EXTDIR/"
-echo "Firefox 128+:  about:debugging  →  This Firefox  →  Load Temporary Add-on  →  select $EXTDIR/manifest.json"
-echo ""
-echo "Then open claude.ai, open DevTools → Console, and look for the purple banner."
+
+cat <<INSTR
+
+Done. Unpacked extension ready at: $EXTDIR/
+  - manifest.json
+  - claude_developer_debug.js
+
+------------------------------------------------------------------------------
+INSTALL - CHROME / EDGE (111+)
+------------------------------------------------------------------------------
+  1. Open  chrome://extensions   (Edge: edge://extensions)
+  2. Turn ON "Developer mode" (top-right toggle)
+  3. "Load unpacked"  ->  select the  $EXTDIR/  folder
+  4. Open or refresh claude.ai - the monitor auto-runs, nothing to paste
+  Update after editing the JS: click the reload icon on the card, then
+  hard-refresh claude.ai (Cmd/Ctrl+Shift+R).
+
+------------------------------------------------------------------------------
+INSTALL - OPERA (Chromium-based; loads this unpacked extension directly)
+------------------------------------------------------------------------------
+  Opera runs on the same Chromium engine as Chrome, so it loads this unpacked
+  Chrome/MV3 extension natively. You do NOT need the "Install Chrome Extensions"
+  bridge add-on here — that bridge is only for pulling listings from the Chrome
+  Web Store; this is a local unpacked folder, so load it directly:
+  1. Open  opera://extensions
+  2. Turn ON "Developer mode" (top-right toggle)
+  3. "Load unpacked"  ->  select the  $EXTDIR/  folder
+  4. Open or refresh claude.ai - the monitor auto-runs, nothing to paste
+  Update after editing the JS: click the reload icon on the card, then
+  hard-refresh claude.ai (Cmd/Ctrl+Shift+R).
+  (Opera also needs to be new enough for "world":"MAIN" content scripts — any
+  Opera built on Chromium 111+; current Opera is well past that.)
+  Note: Opera CANNOT run Firefox (.xpi) add-ons; the Firefox paths below do not
+  apply to it.
+
+------------------------------------------------------------------------------
+INSTALL - FIREFOX, TEMPORARY (any Firefox 128+, wiped on restart)
+------------------------------------------------------------------------------
+  1. Open  about:debugging  ->  "This Firefox"
+  2. "Load Temporary Add-on..."  ->  select  $EXTDIR/manifest.json
+  Disappears when Firefox closes. Fine for a quick look; NOT persistent.
+
+------------------------------------------------------------------------------
+INSTALL - FIREFOX, PERSISTENT (survives restarts)
+------------------------------------------------------------------------------
+  This script ALREADY built the package locally (above):
+      $ZIPDIR/claude_developer_debug-<ver>.zip   and   ...-<ver>.xpi
+  But Release/Beta Firefox REFUSE unsigned add-ons for permanent install, so that
+  bare .xpi will not stick on stock Firefox. Pick ONE path:
+
+  PATH A - Self-sign via Mozilla AMO  (works on ALL Firefox, recommended)
+    cd $EXTDIR
+    # one-time: create API credentials at
+    #   https://addons.mozilla.org/developers/addon/api/key/
+    web-ext sign --channel=unlisted --api-key=YOUR_JWT_ISSUER --api-secret=YOUR_JWT_SECRET
+    # produces a SIGNED .xpi in web-ext-artifacts/  (channel=unlisted keeps it
+    # private to you - it is not published to the public AMO listing)
+    Then in Firefox:  about:addons  ->  gear icon  ->  "Install Add-on From File..."
+    ->  pick that signed .xpi.
+
+  PATH B - Disable signature enforcement  (Developer Edition / Nightly / ESR ONLY)
+    In  about:config  set  xpinstall.signatures.required = false
+        (stock Release/Beta IGNORE this pref - Dev/Nightly/ESR only)
+    Then  about:addons  ->  gear icon  ->  "Install Add-on From File..."
+    ->  pick the  $ZIPDIR/claude_developer_debug-<ver>.xpi  this script just built.
+  An .xpi is just the .zip renamed; Firefox's file installer wants the .xpi name.
+
+------------------------------------------------------------------------------
+VERIFY IT WORKS
+------------------------------------------------------------------------------
+  Open claude.ai  ->  DevTools (F12)  ->  Console: a purple
+  "Claude Developer Debug Monitor active" banner appears with nothing pasted.
+  Send 2+ messages, then either:
+    - click the HUD's  the inject button  to drop a hud_audit snapshot into the
+      chat box (review, then Send), or
+    - run  _claudeDebug.report()  /  _claudeDebug.help()  from the > prompt.
+
+  No banner? Check: extension enabled with no errors; you selected the folder
+  CONTAINING manifest.json; browser is new enough (Chrome 111+ / Firefox 128+);
+  hard-refresh claude.ai.
+
+INSTR
