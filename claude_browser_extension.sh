@@ -179,7 +179,7 @@ cat > "$EXTDIR/manifest.json" << 'EOF'
 {
   "manifest_version": 3,
   "name": "Claude Developer Debug",
-  "version": "1.6",
+  "version": "1.7",
   "description": "Injects the Claude network/performance debug monitor into claude.ai's page context (MAIN world). Logs all API requests, SSE streams, turn latency, and TTFT to the DevTools console.",
   "content_scripts": [
     {
@@ -361,39 +361,52 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   // and a composite rowKey (`nonce:id`) so a ledger can dedup turns correctly.
   const SESSION_NONCE = `${SESSION_START.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
+  // ── localStorage + time-series helpers ──────────────────────────────────────
+  // One place for the "swallow errors" persistence policy and the shared
+  // push/trim logic the usage- and pace-histories both use.
+  const lsGet = (key, fb) => { try { const j = localStorage.getItem(key); return j ? (JSON.parse(j) ?? fb) : fb; } catch (e) { return fb; } };
+  const lsSet = (key, val) => { try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {} };
+  // Trim every array in a { key: [{ ts, … }] } store to entries newer than maxMs.
+  function trimStore(store, maxMs) {
+    const now = Date.now();
+    for (const k of Object.keys(store)) {
+      const a = store[k];
+      store[k] = Array.isArray(a) ? a.filter(x => x && now - x.ts < maxMs) : [];
+    }
+    return store;
+  }
+  // Append a { ts, … } point to store[key] (creating the array), pushing only when
+  // shouldPush(last, point) is true, then trim to maxMs and persist under lsKey.
+  function pushSample(store, lsKey, key, point, maxMs, shouldPush) {
+    const arr = store[key] || (store[key] = []);
+    const last = arr[arr.length - 1];
+    if (!last || shouldPush(last, point)) arr.push(point);
+    const cutoff = point.ts - maxMs;
+    while (arr.length > 1 && arr[0].ts < cutoff) arr.shift();
+    lsSet(lsKey, store);
+  }
+
   // Subscription state (no API key needed). Plan tier + rolling-window quota are
   // the metrics a Free/Pro/Max account is actually metered on. Both persist across
   // reloads via localStorage so a single snapshot can reflect the true window.
   let detectedPlan = null;
-  try { detectedPlan = localStorage.getItem('claudeDebugPlan') || null; } catch (e) {}
-  let quotaWindows = {};   // window-name -> { usedPct, status, resetsAt, capturedAt }
-  try { const j = localStorage.getItem('claudeDebugQuota'); if (j) quotaWindows = JSON.parse(j) || {}; } catch (e) {}
-  { const _now = Date.now();   // drop windows whose reset has already passed
-    for (const k in quotaWindows) { const w = quotaWindows[k]; if (w && Number.isFinite(w.resetsAt) && w.resetsAt < _now) delete quotaWindows[k]; } }
+  try { detectedPlan = localStorage.getItem('claudeDebugPlan') || null; } catch (e) {}   // raw string, not JSON
+  // window-name -> { usedPct, status, resetsAt, capturedAt }; drop windows already past reset.
+  let quotaWindows = lsGet('claudeDebugQuota', {});
+  { const _now = Date.now();
+    for (const k of Object.keys(quotaWindows)) { const w = quotaWindows[k]; if (w && Number.isFinite(w.resetsAt) && w.resetsAt < _now) delete quotaWindows[k]; } }
 
   // Short history of usedPct readings per window (for burn-rate / minutes-to-cap).
-  let usageHistory = {};   // window-name -> [{ ts, used }]
-  try { const j = localStorage.getItem('claudeDebugUsageHist'); if (j) usageHistory = JSON.parse(j) || {}; } catch (e) {}
-  { const _now = Date.now();   // drop readings older than an hour on load
-    for (const k in usageHistory) { const a = usageHistory[k]; usageHistory[k] = Array.isArray(a) ? a.filter(x => x && _now - x.ts < 3600000) : []; } }
+  let usageHistory = trimStore(lsGet('claudeDebugUsageHist', {}), 3600000);   // drop readings >1h on load
 
   // Pace time-series per window (for the tachometer graph): one { ts, mult } point
-  // appended each /usage poll once a pace is computable. Retained PACE_LOG_MS so the
-  // graph can show the whole 5h window's worth of "RPM" history.
+  // appended each /usage poll once a pace is computable, retained PACE_LOG_MS.
   const PACE_LOG_MS = 5 * 60 * 60 * 1000;   // keep ~5h of pace points
-  let paceLog = {};        // window-name -> [{ ts, mult }]
-  try { const j = localStorage.getItem('claudeDebugPaceLog'); if (j) paceLog = JSON.parse(j) || {}; } catch (e) {}
-  { const _now = Date.now();
-    for (const k in paceLog) { const a = paceLog[k]; paceLog[k] = Array.isArray(a) ? a.filter(x => x && _now - x.ts < PACE_LOG_MS) : []; } }
+  let paceLog = trimStore(lsGet('claudeDebugPaceLog', {}), PACE_LOG_MS);
   function recordPaceSample(name, mult) {
     if (typeof mult !== 'number' || !Number.isFinite(mult)) return;
-    const now = Date.now();
-    const arr = paceLog[name] || (paceLog[name] = []);
-    const last = arr[arr.length - 1];
-    if (!last || now - last.ts > 5000) arr.push({ ts: now, mult });   // skip rapid dupes
-    const cutoff = now - PACE_LOG_MS;
-    while (arr.length > 1 && arr[0].ts < cutoff) arr.shift();
-    try { localStorage.setItem('claudeDebugPaceLog', JSON.stringify(paceLog)); } catch (e) {}
+    pushSample(paceLog, 'claudeDebugPaceLog', name, { ts: Date.now(), mult }, PACE_LOG_MS,
+      (last, p) => p.ts - last.ts > 5000);   // skip rapid dupes
   }
 
   // On-page overlay (HUD) state
@@ -474,7 +487,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
       const resetsAt = Number.isFinite(w.resetsInMs) ? now + w.resetsInMs : null;
       quotaWindows[w.name] = { usedPct: (w.usedPct != null ? w.usedPct : null), status: w.status || null, resetsAt, capturedAt: now };
     }
-    try { localStorage.setItem('claudeDebugQuota', JSON.stringify(quotaWindows)); } catch (e) {}
+    lsSet('claudeDebugQuota', quotaWindows);
   }
 
   // The /api/organizations/<id>/usage payload is a DIFFERENT shape from the SSE
@@ -507,7 +520,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     // Now that this poll's usedPct samples are recorded, compute the 5h pace and log
     // it as a tachometer point (null early on, when there is no baseline yet).
     if (hit) { const pp = usagePace('5h'); if (pp && pp.multiplier != null) recordPaceSample('5h', pp.multiplier); }
-    if (hit) { try { localStorage.setItem('claudeDebugQuota', JSON.stringify(quotaWindows)); } catch (e) {} }
+    if (hit) lsSet('claudeDebugQuota', quotaWindows);
     return hit;
   }
 
@@ -603,36 +616,38 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     const w = q.windows.find(x => x.name === name);
     return w && w.util != null ? w.util : null;
   }
+  // Shared pace-selection used by both windowPace (turnLog utilisation) and
+  // usagePace (/usage history). Given samples ascending by ts, return the newest
+  // point (b) and the oldest within lookback (a; fallback: the first point just
+  // past the cutoff), plus the real elapsed span in minutes. null if <2 / no span.
+  function pickSpan(samples, lookbackMs) {
+    if (!Array.isArray(samples) || samples.length < 2) return null;
+    const b = samples[samples.length - 1];
+    const cutoff = b.ts - lookbackMs;
+    let a = null;
+    for (let i = samples.length - 2; i >= 0; i--) {
+      if (samples[i].ts >= cutoff) a = samples[i];      // keep walking back to the oldest in-window
+      else { if (!a) a = samples[i]; break; }           // first sample past the cutoff (fallback only)
+    }
+    if (!a) return null;
+    const elapsedMin = (b.ts - a.ts) / 60000;
+    return elapsedMin > 0 ? { a, b, elapsedMin } : null;
+  }
   function windowPace(name, lookbackMs = PACE_LOOKBACK_MS) {
     const winMin = windowMinutes(name);
     if (!winMin) return null;
-    // newest sample carrying this window's utilisation
-    let iNow = -1, utilNow = null;
-    for (let i = turnLog.length - 1; i >= 0; i--) {
+    // {ts, util} for every turn that carries this window's utilisation
+    const samples = [];
+    for (let i = 0; i < turnLog.length; i++) {
       const u = windowUtilAt(i, name);
-      if (u != null) { iNow = i; utilNow = u; break; }
+      if (u != null) samples.push({ ts: turnLog[i].ts, util: u });
     }
-    if (iNow < 0) return null;
-    const tsNow = turnLog[iNow].ts;
-    // Prefer the OLDEST sample within the lookback window (interval ~= lookback);
-    // if none is inside it, fall back to the most recent sample just before it so
-    // a baseline still exists. The reported elapsedMin is always the real span.
-    const cutoff = tsNow - lookbackMs;
-    let iThen = -1;
-    for (let i = iNow - 1; i >= 0; i--) {
-      if (windowUtilAt(i, name) == null) continue;
-      if (turnLog[i].ts >= cutoff) { iThen = i; }       // keep walking back to the oldest in-window
-      else { if (iThen < 0) iThen = i; break; }         // first sample past the cutoff (fallback only)
-    }
-    if (iThen < 0) return null;
-    const tsThen = turnLog[iThen].ts;
-    const utilThen = windowUtilAt(iThen, name);
-    const elapsedMin = (tsNow - tsThen) / 60000;
-    if (!(elapsedMin > 0) || utilThen == null) return null;
-    const deltaUtil = utilNow - utilThen;               // signed fraction
-    const timeImplied = elapsedMin / winMin;            // fraction of budget time alone accounts for
+    const span = pickSpan(samples, lookbackMs);
+    if (!span) return null;
+    const deltaUtil = span.b.util - span.a.util;        // signed fraction
+    const timeImplied = span.elapsedMin / winMin;        // fraction of budget time alone accounts for
     if (timeImplied <= 0) return null;
-    return { multiplier: deltaUtil / timeImplied, deltaPP: deltaUtil * 100, elapsedMin };
+    return { multiplier: deltaUtil / timeImplied, deltaPP: deltaUtil * 100, elapsedMin: span.elapsedMin };
   }
   function fmtPace(p) {                                  // "1.42x time (+4.7pp / 9.8m)"
     const sign = p.deltaPP >= 0 ? '+' : '';
@@ -646,13 +661,8 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   const USAGE_HISTORY_MS = 15 * 60 * 1000;   // retain ~15 min of readings
   function recordUsageSample(name, used) {
     if (typeof used !== 'number') return;
-    const now = Date.now();
-    const arr = usageHistory[name] || (usageHistory[name] = []);
-    const last = arr[arr.length - 1];
-    if (!last || last.used !== used || now - last.ts > 20000) arr.push({ ts: now, used });   // skip identical spam
-    const cutoff = now - USAGE_HISTORY_MS - 60000;   // keep a little extra for a fallback baseline
-    while (arr.length > 1 && arr[0].ts < cutoff) arr.shift();
-    try { localStorage.setItem('claudeDebugUsageHist', JSON.stringify(usageHistory)); } catch (e) {}
+    pushSample(usageHistory, 'claudeDebugUsageHist', name, { ts: Date.now(), used }, USAGE_HISTORY_MS + 60000,
+      (last, p) => last.used !== p.used || p.ts - last.ts > 20000);   // skip identical spam; keep a fallback baseline
   }
   // Pace + estMinsLeft for a /usage window. multiplier matches windowPace() (1.0 =
   // on track to hit the cap exactly at reset). estMinsLeft = minutes until usedPct
@@ -660,18 +670,9 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   // null when flat/recovering or no baseline yet.
   function usagePace(name, lookbackMs = PACE_LOOKBACK_MS) {
     const winMin = windowMinutes(name);
-    const arr = usageHistory[name];
-    if (!winMin || !arr || arr.length < 2) return null;
-    const now = arr[arr.length - 1];
-    const cutoff = now.ts - lookbackMs;
-    let then = null;
-    for (let i = arr.length - 2; i >= 0; i--) {
-      if (arr[i].ts >= cutoff) then = arr[i];            // oldest reading within lookback
-      else { if (!then) then = arr[i]; break; }          // fallback: first reading just past the cutoff
-    }
-    if (!then) return null;
-    const elapsedMin = (now.ts - then.ts) / 60000;
-    if (!(elapsedMin > 0)) return null;
+    const span = pickSpan(usageHistory[name], lookbackMs);
+    if (!winMin || !span) return null;
+    const now = span.b, then = span.a, elapsedMin = span.elapsedMin;
     const deltaPP = now.used - then.used;                // percentage points (signed)
     const burnPerMin = deltaPP / elapsedMin;             // pp/min (signed)
     const timeImplied = elapsedMin / winMin;
@@ -2222,13 +2223,13 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     hudRoot.appendChild(hudBody);
     hudRoot.appendChild(hudFoot);
     (document.body || document.documentElement).appendChild(hudRoot);
-    if (hudPos == null) { try { const j = localStorage.getItem('claudeDebugHudPos'); if (j) hudPos = JSON.parse(j); } catch (e) {} }
+    if (hudPos == null) hudPos = lsGet('claudeDebugHudPos', null);
     if (hudPos && Number.isFinite(hudPos.left) && Number.isFinite(hudPos.top)) {
       const L = Math.max(0, Math.min(hudPos.left, window.innerWidth  - hudRoot.offsetWidth));
       const T = Math.max(0, Math.min(hudPos.top,  window.innerHeight - hudRoot.offsetHeight));
       css(hudRoot, { left: L + 'px', top: T + 'px', right: 'auto', bottom: 'auto' });
     }
-    makeDraggable(hudRoot, header, (pos) => { hudPos = pos; try { localStorage.setItem('claudeDebugHudPos', JSON.stringify(pos)); } catch (e) {} });
+    makeDraggable(hudRoot, header, (pos) => { hudPos = pos; lsSet('claudeDebugHudPos', pos); });
     setCollapsed(hudCollapsed);
   }
 
@@ -2427,6 +2428,18 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     return { root, head, title, body };
   }
 
+  // Shared panel helpers: position a side panel just below the main HUD (once, at
+  // creation, so drags aren't yanked back), and detach a panel from the DOM.
+  function placeBelowHud(root) {
+    if (root && hudRoot && hudRoot.getBoundingClientRect) {
+      const r = hudRoot.getBoundingClientRect();
+      if (r.height) root.style.top = Math.round(r.bottom + 8) + 'px';
+    }
+  }
+  function removePanel(root) {
+    if (root && root.parentNode) root.parentNode.removeChild(root);
+  }
+
   function ensureResultHud() {
     if (resultRoot) return;
     const p = makePanel('left');
@@ -2439,7 +2452,7 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
   }
 
   function destroyResultHud() {
-    if (resultRoot && resultRoot.parentNode) resultRoot.parentNode.removeChild(resultRoot);
+    removePanel(resultRoot);
     resultRoot = resultHead = resultTitle = resultBody = null;
   }
 
@@ -2471,17 +2484,13 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     css(histTitle, { fontWeight: 'bold', color: '#cdbcff' });
     p.head.appendChild(mkBtn('×', 'Close histogram', () => destroyHistHud()));
     (document.body || document.documentElement).appendChild(histRoot);
-    // Position once, at creation: sit just below the main HUD if it's visible,
-    // else keep the default top. Done here (not in renderHistHud) so re-renders
-    // on metric-cycle don't yank the panel back after the user has dragged it.
-    if (hudRoot && hudRoot.getBoundingClientRect) {
-      const r = hudRoot.getBoundingClientRect();
-      if (r.height) histRoot.style.top = Math.round(r.bottom + 8) + 'px';
-    }
+    // Position once, at creation (so re-renders on metric-cycle don't yank it back
+    // after the user has dragged it).
+    placeBelowHud(histRoot);
   }
 
   function destroyHistHud() {
-    if (histRoot && histRoot.parentNode) histRoot.parentNode.removeChild(histRoot);
+    removePanel(histRoot);
     histRoot = histTitle = histBody = null;
   }
 
@@ -2526,14 +2535,10 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     css(paceTitle, { fontWeight: 'bold', color: '#cdbcff' });
     p.head.appendChild(mkBtn('×', 'Close tachometer', () => destroyPaceHud()));
     (document.body || document.documentElement).appendChild(paceRoot);
-    // sit below the main HUD if visible (set once at creation, like the hist panel)
-    if (hudRoot && hudRoot.getBoundingClientRect) {
-      const r = hudRoot.getBoundingClientRect();
-      if (r.height) paceRoot.style.top = Math.round(r.bottom + 8) + 'px';
-    }
+    placeBelowHud(paceRoot);   // sit below the main HUD if visible (set once at creation)
   }
   function destroyPaceHud() {
-    if (paceRoot && paceRoot.parentNode) paceRoot.parentNode.removeChild(paceRoot);
+    removePanel(paceRoot);
     paceRoot = paceTitle = paceBody = null;
   }
   function renderPaceHud() {
