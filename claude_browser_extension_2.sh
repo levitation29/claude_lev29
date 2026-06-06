@@ -7,12 +7,13 @@
 #   onto every claude.ai page. The HUD has three action icons and does nothing
 #   else (no network monitor, no audit/probe/histogram):
 #
-#     📝  Fetch command_2_preferences.notes from GitHub AT RUNTIME and fill
-#         Settings ▸ General "Instructions for Claude" with it. Nothing is baked
-#         in. Acts only inside an open settings dialog (never the chat composer);
-#         saves via the dialog's Save button if present, else blurs to autosave.
-#     🏷  Read the plan name off Settings ▸ Billing and show it in the HUD.
-#     ⌘  List the command shortcuts parsed from the fetched prefs (one per line);
+#     📝  With Settings ▸ General open, fetch command_2_preferences.notes from
+#         GitHub AT RUNTIME and fill "Instructions for Claude" with it. Nothing is
+#         baked in. It acts ONLY inside the open settings dialog and NEVER touches
+#         the chat composer; saves via the dialog's Save button if present, else
+#         blurs to autosave. (If Settings isn't open, it says so and does nothing.)
+#     🏷  With Settings ▸ Billing open, read the plan name into the HUD.
+#     📋  List the command shortcuts parsed from the fetched prefs (one per line);
 #         click one to insert it into the claude.ai composer. A command is any
 #         backtick `token` or bold **token** that is a bare command id — so it
 #         catches bold-defined commands (zip-project, unzip-project) but skips
@@ -52,12 +53,14 @@
 #      private, or the path/branch/filename changes, 📝 reports
 #      "✗ fetch failed: HTTP 404" (or similar). Fix by editing PREFS_URL below.
 #      A private repo will NOT work — the content script sends no credentials.
-#   3. The Settings-dialog and Save-button matching is best-effort against
-#      claude.ai's CURRENT markup (open dialog → its textarea; button text /save/i;
-#      plan text "<tier> plan"). If claude.ai changes its DOM, 📝/🏷 may miss their
-#      target — the HUD status line and the "[Claude HUD 2]" console log show what
-#      happened, and 📝 refuses rather than risk pasting into the chat composer.
-#   4. The ⌘ command list is INFERRED from the prefs prose: a command is any
+#   3. 📝/🏷 act only on an ALREADY-OPEN settings dialog (open Settings ▸ General
+#      or ▸ Billing yourself first). claude.ai does not reliably open Settings from
+#      a URL-hash change, so this build does not try to auto-open it. The matching
+#      is best-effort against claude.ai's CURRENT markup (open dialog → its
+#      textarea; Save button text/aria /save/i; plan text "<tier> plan"); if the
+#      DOM changes, the HUD status line says so, and 📝 only ever writes inside the
+#      settings dialog — NEVER the chat composer.
+#   4. The 📋 command list is INFERRED from the prefs prose: a command is any
 #      backtick `token` or bold **token** that is a bare command id. It now tracks
 #      both markups (so bold-defined zip-project / unzip-project are caught), but a
 #      command written some other way (e.g. a bare word in a table, no backtick or
@@ -65,7 +68,7 @@
 #      dedicated "## COMMANDS" block in the notes that the extension parses
 #      verbatim. A small blocklist drops shell/field stragglers (cp, rm, unzip,
 #      working_name, …); edit CMD_BLOCK below if the prose adds new false hits.
-#   5. ⌘ composer insertion uses the SAME best-effort ProseMirror path as
+#   5. 📋 composer insertion uses the SAME best-effort ProseMirror path as
 #      claude_browser_extension.sh (focus the editor → execCommand insertText,
 #      verify against the DOM, else a synthetic beforeinput, else copy to
 #      clipboard). It inherits the same fragility: if claude.ai changes its editor
@@ -87,11 +90,11 @@
 #   (refresh claude.ai to bring it back — see CAVEAT 1 re: console helpers).
 #
 # USAGE
-#   📝  Open Settings ▸ General, click 📝 → it fetches the prefs from GitHub,
+#   📝  Open Settings ▸ General, then click 📝 → it fetches the prefs from GitHub,
 #       clears the box, pastes, and clicks Save (or blurs to autosave). The fetch
 #       is cached per page load — refresh claude.ai to pull updated prefs.
-#   🏷  Open Settings ▸ Billing, click 🏷 → the HUD shows e.g. "🏷 Max plan".
-#   ⌘  Click ⌘ → the HUD fetches the prefs and lists every command shortcut
+#   🏷  Open Settings ▸ Billing, then click 🏷 → the HUD shows e.g. "🏷 Max plan".
+#   📋  Click 📋 → the HUD fetches the prefs and lists every command shortcut
 #       (filter box + one button per command). Click a command → it is inserted
 #       into the message composer (focus it first; falls back to clipboard).
 #   Each action also logs its result to the DevTools console ("[Claude HUD 2]").
@@ -110,8 +113,8 @@ cat > "$EXTDIR/manifest.json" << 'MANIFEST_EOF'
 {
   "manifest_version": 3,
   "name": "Claude HUD 2 — Actions",
-  "version": "2.3",
-  "description": "A minimal draggable HUD on claude.ai with three action icons: fetch your preferences from GitHub and fill the Instructions box (dialog-scoped), read the plan name off Billing, and list command shortcuts that insert into the composer.",
+  "version": "2.6",
+  "description": "A minimal draggable HUD on claude.ai with three action icons: with Settings ▸ General open, fill the Instructions box from GitHub (dialog-scoped); with Settings ▸ Billing open, read the plan name; and list command shortcuts that insert into the composer.",
   "host_permissions": ["https://raw.githubusercontent.com/*"],
   "content_scripts": [
     {
@@ -185,11 +188,9 @@ cat > "$EXTDIR/claude_hud2.js" << 'JS_EOF'
 
   // ── action 1: fetch prefs, clear + paste into the instructions box, then save
   function findInstructionsBox() {
-    const dialogs = openDialogs();
-    const scopes = dialogs.length ? dialogs
-                 : (/settings/i.test(location.hash) ? [document] : []);
-    for (let i = 0; i < scopes.length; i++) {
-      const tas = [].slice.call(scopes[i].querySelectorAll('textarea'))
+    const dialogs = openDialogs();          // only inside a real open settings modal
+    for (let i = 0; i < dialogs.length; i++) {
+      const tas = [].slice.call(dialogs[i].querySelectorAll('textarea'))
                     .filter(function (t) { return t.offsetParent !== null; });
       const named = tas.find(function (t) {
         const hay = (t.placeholder || '') + ' ' + (t.getAttribute('aria-label') || '') +
@@ -199,19 +200,21 @@ cat > "$EXTDIR/claude_hud2.js" << 'JS_EOF'
       if (named) return named;
       if (tas.length === 1) return tas[0];   // lone textarea in an open dialog = the box
     }
-    return null;   // never fall through to the composer
+    return null;   // no open dialog → do nothing (never the chat composer)
   }
   function clickSaveIn(scope) {
     const btns = [].slice.call((scope || document).querySelectorAll('button, [role="button"]'))
       .filter(function (b) {
-        return b.offsetParent !== null && !b.disabled && /\bsave\b/i.test((b.textContent || '').trim());
+        if (b.offsetParent === null || b.disabled) return false;
+        const hay = ((b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).trim();
+        return /\bsave\b/i.test(hay);
       });
     if (btns.length) { btns[0].click(); return true; }
     return false;
   }
   async function fillInstructions() {
     const box = findInstructionsBox();
-    if (!box) return '\u2717 no instructions box \u2014 open Settings \u25b8 General first (won\u2019t touch the chat box)';
+    if (!box) return '\u2717 open Settings \u25b8 General first, then click \ud83d\udcdd (won\u2019t touch the chat box)';
     let prefs;
     try { prefs = await loadPrefs(); }
     catch (e) { return '\u2717 fetch failed: ' + (e && e.message ? e.message : String(e)); }
@@ -223,10 +226,10 @@ cat > "$EXTDIR/claude_hud2.js" << 'JS_EOF'
       return '\u2717 could not set value: ' + (e && e.message ? e.message : String(e));
     }
     const scope = box.closest('[role="dialog"], [aria-modal="true"]') || document;
-    box.blur();                                  // "click outside"
+    box.blur();                                  // "click outside" -> autosave
     const saved = clickSaveIn(scope);
     return '\u2713 wrote ' + prefs.length + ' chars (from GitHub)' +
-           (saved ? ' + clicked Save' : ' \u2014 blurred to save (no Save button found)');
+           (saved ? ' + clicked Save' : ' \u2014 blurred to autosave');
   }
 
   // ── action 2: read the plan name off the billing popup ─────────────────────
@@ -244,7 +247,7 @@ cat > "$EXTDIR/claude_hud2.js" << 'JS_EOF'
         if (m && n.parentElement && n.parentElement.offsetParent !== null) return '\ud83c\udff7 ' + m[0].trim();
       }
     }
-    return '\u2717 no plan text found \u2014 open Settings \u25b8 Billing first';
+    return '\u2717 open Settings \u25b8 Billing first, then click \ud83c\udff7';
   }
 
   // ── action 3: list command shortcuts from the prefs; click → composer ──────
@@ -292,7 +295,7 @@ cat > "$EXTDIR/claude_hud2.js" << 'JS_EOF'
       : navigator.clipboard.writeText(text).then(() => '\u2717 insert refused \u2014 copied "' + text + '" instead');
   }
 
-  // The command panel, toggled by the \u2318 header button. Reuses loadPrefs().
+  // The command panel, toggled by the \ud83d\udccb header button. Reuses loadPrefs().
   let cmdPanel = null;
   async function toggleCommands() {
     if (cmdPanel) { cmdPanel.remove(); cmdPanel = null; return 'commands hidden'; }
@@ -406,12 +409,12 @@ cat > "$EXTDIR/claude_hud2.js" << 'JS_EOF'
     css(closeBtn, { marginRight: '10px' });
     btns.appendChild(closeBtn);
     btns.appendChild(mkBtn('\ud83d\udcdd',
-      'Fetch your preferences from GitHub and fill the Instructions box (Settings \u25b8 General), then save',
-      () => { setStatus('\u23f3 fetching preferences\u2026'); fillInstructions().then(setStatus); }));
+      'With Settings \u25b8 General open: fetch your preferences from GitHub and fill the Instructions box, then save',
+      () => { setStatus('\u23f3 fetching preferences\u2026'); Promise.resolve(fillInstructions()).then(setStatus); }));
     btns.appendChild(mkBtn('\ud83c\udff7',
-      'Read the plan name from Settings \u25b8 Billing',
+      'With Settings \u25b8 Billing open: read the plan name',
       () => setStatus(readPlan())));
-    btns.appendChild(mkBtn('\u2318',
+    btns.appendChild(mkBtn('\ud83d\udccb',
       'Command shortcuts \u2014 fetch from GitHub, click one to insert it into the composer',
       () => { setStatus('\u23f3 loading commands\u2026'); Promise.resolve(toggleCommands()).then(setStatus); }));
 
@@ -421,7 +424,7 @@ cat > "$EXTDIR/claude_hud2.js" << 'JS_EOF'
     hudStatus = document.createElement('div');
     css(hudStatus, { padding: '6px 8px', whiteSpace: 'normal', overflowWrap: 'anywhere',
       color: '#9a8cc8', fontSize: '11px', lineHeight: '1.35' });
-    hudStatus.textContent = '\ud83d\udcdd prefs \u00b7 \ud83c\udff7 plan \u00b7 \u2318 commands';
+    hudStatus.textContent = '\ud83d\udcdd prefs \u00b7 \ud83c\udff7 plan \u00b7 \ud83d\udccb commands';
 
     hudRoot.appendChild(header);
     hudRoot.appendChild(hudStatus);
@@ -515,7 +518,7 @@ VERIFY IT WORKS
   On claude.ai a purple "Claude HUD" panel appears top-right with three icons:
     📝  paste your prefs into Settings ▸ General "Instructions for Claude"
     🏷  read the plan name off Settings ▸ Billing
-    ⌘  list command shortcuts — click one to insert it into the composer
+    📋  list command shortcuts — click one to insert it into the composer
   No panel? Check: extension enabled with no errors; you selected the folder
   CONTAINING manifest.json; browser new enough (Chromium 111+ / Firefox 109+);
   hard-refresh claude.ai.
