@@ -2340,15 +2340,33 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
     const timeLeft1x = (reset5Min != null) ? reset5Min : Math.max(0, Math.round(FIVE_H_MIN - s.sessionMs / 60000));
     const _p5 = usagePace('5h');
     const est5 = (_p5 && _p5.estMinsLeft != null) ? _p5.estMinsLeft : null;
-    const paceLine = (est5 != null && est5 < timeLeft1x)
-      ? { t: 'estMins'.padEnd(13)    + `${est5}m  (< timeLeft1x ${timeLeft1x}m \u2014 above 1x pace)`, c: '#ff6b6b' }
-      : { t: 'timeLeft1x'.padEnd(13) + `${timeLeft1x}m`, c: '#5cdd7b' };
+    // Split across two lines so the pace annotation never bleeds past the HUD's
+    // right edge: line 1 is the value, line 2 is the indented pace note (same colour,
+    // aligned under the value column). Applies to both the above-1x and below-1x cases.
+    const _ind = ' '.repeat(13);
+    let paceLines;
+    if (est5 != null && est5 < timeLeft1x) {                  // burning ABOVE 1x -> cap before reset
+      paceLines = [
+        { t: 'estMins'.padEnd(13) + `${est5}m`,               c: '#ff6b6b' },
+        { t: _ind + `above 1\u00d7 pace \u00b7 1\u00d7 left ${timeLeft1x}m`, c: '#ff6b6b' },
+      ];
+    } else if (est5 != null) {                                // at/below 1x -> reset before cap
+      paceLines = [
+        { t: 'timeLeft1x'.padEnd(13) + `${timeLeft1x}m`,      c: '#5cdd7b' },
+        { t: _ind + `at/below 1\u00d7 pace \u00b7 cap ${est5}m`, c: '#5cdd7b' },
+      ];
+    } else {                                                  // no pace computed yet
+      paceLines = [
+        { t: 'timeLeft1x'.padEnd(13) + `${timeLeft1x}m`,      c: '#5cdd7b' },
+        { t: _ind + `1\u00d7 runway \u00b7 pace pending`,   c: '#5cdd7b' },
+      ];
+    }
 
     const bodyItems = [
       `turns        ${s.turns}   (in-flight ${s.inFlight})`,
       `time         session ${fmtDur(s.sessionMs)} · chat ${fmtDur(s.chatMs)}`,
       `             gen ${fmtDur(s.engagedMs)} / idle ${fmtDur(Math.max(0, s.chatMs - s.engagedMs))}`,
-      paceLine,
+      ...paceLines,
       `total        med ${fmtMs(s.medianTotalMs)} / p90 ${fmtMs(s.p90TotalMs)}`,
       `TTFT         med ${fmtMs(s.medianTTFTMs)}`,
       `tokens       ${s.turns && s.exactTurns === s.turns ? '' : '~'}${s.tokensTotal}  (in+out; ${s.exactTurns}/${s.turns} exact)`,
