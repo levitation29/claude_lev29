@@ -37,8 +37,19 @@
 #   so that restriction costs us nothing here.
 #
 # HOW TO RUN
-#   chmod +x claude_browser_extension.sh
-#   ./claude_browser_extension.sh
+#   Place claude_browser_preflight.sh in the SAME directory as this script.
+#   The shared preflight verifies that node + npm + web-ext are installed (and
+#   prints install instructions if not). Then:
+#
+#     chmod +x claude_browser_extension.sh claude_browser_preflight.sh
+#     ./claude_browser_extension.sh
+#
+#   On success this produces the unpacked folder, a packaged .zip, and an .xpi
+#   ready for direct install (see the FIREFOX install paths below).
+#
+# SEE ALSO
+#   browser_extension_signing.md (next to this script) — complete guide to
+#   Firefox signing and AMO distribution. Consult it for all signing options.
 #
 # ─── INSTALLING IN CHROME (v111+) ─────────────────────────────────────────────
 #
@@ -63,16 +74,31 @@
 #   On older Firefox the script still loads but runs in the ISOLATED world and
 #   will NOT intercept fetch (the failure mode described above).
 #
-#   Temporary install (lasts until Firefox restarts):
-#   1. Open Firefox and go to:  about:debugging
-#   2. Click "This Firefox" in the left sidebar
-#   3. Click "Load Temporary Add-on..."
-#   4. Navigate into claude-debug-extension/ and select manifest.json
+#   HOW LONG DOES IT LAST?  Firefox treats add-ons differently from Chrome — the
+#   answer depends entirely on which install path you use:
 #
-#   Permanent install (Firefox won't keep unpacked MV3 add-ons without signing):
-#     npm install -g web-ext
-#     cd claude-debug-extension
-#     web-ext build          # produces a .zip you can self-sign / sideload
+#   (1) TEMPORARY ADD-ON  (about:debugging → "Load Temporary Add-on...")
+#       Lives until you close Firefox. Restart → gone. Also wiped on a crash.
+#       Fine for dev iteration; useless for "install once and forget."
+#       Steps:
+#         a. Open Firefox and go to:  about:debugging
+#         b. Click "This Firefox" in the left sidebar
+#         c. Click "Load Temporary Add-on..."
+#         d. Navigate into claude-debug-extension/ and select manifest.json
+#
+#   (2) PERMANENT, UNSIGNED  (Nightly / Developer Edition / ESR ONLY)
+#       In  about:config  set  xpinstall.signatures.required = false , then
+#       about:addons → gear → "Install Add-on From File..." → pick the .xpi.
+#       Stays installed until you remove it. Stock Release/Beta IGNORE this pref
+#       and will refuse the unsigned add-on, so this path only works on the
+#       developer-oriented channels. Fastest for solo dev work on Nightly.
+#
+#   For signing/AMO distribution options: see browser_extension_signing.md.
+#
+#   QUICK PICKER:
+#     - "I just want to poke at it for one session"        → (1) Temporary
+#     - "I'm on Nightly/Dev Edition and want it sticky"    → (2) Unsigned + pref
+#     - For signed/AMO options: see browser_extension_signing.md
 #
 # ─── VERIFYING IT WORKS ───────────────────────────────────────────────────────
 #
@@ -139,23 +165,32 @@
 #   original is handed back to claude.ai untouched. No persistence beyond the
 #   page's lifetime — turn data lives in memory and clears on refresh.
 #
-# ─── PUBLIC RELEASE NOTES (for future reference) ─────────────────────────────
+# ─── PUBLIC RELEASE ───────────────────────────────────────────────────────────
 #
-#   If you ever want to publish to the Chrome Web Store or Firefox AMO:
-#     Chrome Web Store: one-time $5 developer fee; review takes days–weeks;
-#       reviewers scrutinize fetch() interception, so expect to supply a privacy
-#       policy stating no data leaves the browser.
-#       https://chrome.google.com/webstore/devconsole
-#     Firefox AMO: free; faster review (~1–3 days for listed add-ons); same
-#       privacy-policy requirement for network-intercepting add-ons.
-#       https://addons.mozilla.org/developers/
-#   For technical users, shipping the .js with "paste in console" instructions
-#   has zero friction and no review. A store release only makes sense for broad
-#   non-technical reach.
+#   To publish to the Chrome Web Store or Firefox AMO, see
+#   browser_extension_signing.md for the full guide (costs, review notes,
+#   privacy-policy and reviewer-notes text).
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
+
+# ─── preflight: required tooling ─────────────────────────────────────────────
+# Source the shared preflight (must sit next to this script). It hard-fails
+# (exit 1) if web-ext is missing, with install instructions for node/npm/web-ext.
+# On success it exports: PACKAGER, SIGNING_AVAILABLE, HAS_*, *_VER.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ ! -f "$HERE/claude_browser_preflight.sh" ]; then
+  cat >&2 <<EOF
+ERROR: claude_browser_preflight.sh not found next to this script.
+Expected at: $HERE/claude_browser_preflight.sh
+Put all three files (claude_browser_extension.sh, claude_browser_extension_2.sh,
+and claude_browser_preflight.sh) in the same directory and re-run.
+EOF
+  exit 1
+fi
+# shellcheck disable=SC1091
+. "$HERE/claude_browser_preflight.sh"
 
 EXTDIR="claude-debug-extension"
 
@@ -174,6 +209,15 @@ mkdir -p "$EXTDIR"
 #   "run_at": document_start — patch fetch BEFORE claude.ai's bundle loads, so
 #                              no early requests are missed.
 #   "matches"                — restricts the extension to claude.ai only.
+#   browser_specific_settings.gecko.id
+#                            — Stable, explicit add-on ID. Required for AMO
+#                              signing (see browser_extension_signing.md).
+#                              Chrome ignores the whole browser_specific_settings
+#                              block, so this is Firefox-only metadata.
+#   browser_specific_settings.gecko.data_collection_permissions
+#                            — Required by AMO (since 2025-11-03). Value ["none"]
+#                              declares no data collected (truthful — everything
+#                              stays in page memory). Firefox shows this at install.
 
 cat > "$EXTDIR/manifest.json" << 'EOF'
 {
@@ -188,7 +232,14 @@ cat > "$EXTDIR/manifest.json" << 'EOF'
       "run_at": "document_start",
       "world": "MAIN"
     }
-  ]
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "claude-developer-debug@local",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  }
 }
 EOF
 
@@ -2573,23 +2624,34 @@ cat > "$EXTDIR/claude_developer_debug.js" << 'EOF'
         paceBody.appendChild(d);
         return;
       }
-      // geometry — fixed 0..4x dial (like a real tachometer), so the needle height
-      // is comparable across renders and the 1x redline sits at a constant place.
+      // geometry — Y ceiling expands when pace exceeds 4× (up to ~30× displayable).
       const WHITE = '#ffffff';
       const W = 312, H = 150, m = { l: 34, r: 10, t: 10, b: 22 };
       const t0 = pts[0].ts, t1 = pts[pts.length - 1].ts, span = Math.max(1, t1 - t0);
-      const maxM = 4;
+      // Dynamic ceiling: floor at 4×; rounds up to the next clean boundary above the data max.
+      const datMax = pts.reduce((a, p) => Math.max(a, p.mult), 0);
+      const maxM = datMax <= 4  ? 4
+                 : datMax <= 10 ? Math.ceil(datMax)
+                 : Math.ceil(datMax / 5) * 5;
       const X = t => m.l + (W - m.l - m.r) * ((t - t0) / span);
       const Y = v => m.t + (H - m.t - m.b) * (1 - Math.min(Math.max(v, 0), maxM) / maxM);
       let svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
       svg += `<line x1="${m.l}" y1="${m.t}" x2="${m.l}" y2="${H - m.b}" stroke="${GRID}"/>`;
       svg += `<line x1="${m.l}" y1="${H - m.b}" x2="${W - m.r}" y2="${H - m.b}" stroke="${GRID}"/>`;
-      // y-axis gridlines + labels at the requested marks (1.0 is drawn below as the redline)
-      const TICKS = [0, 0.5, 1, 1.5, 2, 3, 4];
+      // y-axis gridlines + labels; tick density scales with range
+      const TICKS = (() => {
+        if (maxM <= 4) return [0, 0.5, 1, 1.5, 2, 3, 4];
+        const step = maxM <= 6 ? 1 : maxM <= 10 ? 2 : 5;
+        const t = [];
+        for (let v = 0; v <= maxM; v += step) t.push(v);
+        if (t[t.length - 1] < maxM) t.push(maxM);
+        return t;
+      })();
       for (const tk of TICKS) {
         const yy = Y(tk);
         if (tk !== 1) svg += `<line x1="${m.l}" y1="${yy.toFixed(1)}" x2="${W - m.r}" y2="${yy.toFixed(1)}" stroke="${GRID}"/>`;
-        svg += `<text x="${m.l - 4}" y="${(yy + 3).toFixed(1)}" fill="${WHITE}" font-size="8" text-anchor="end">${tk.toFixed(1)}</text>`;
+        const tkLabel = Number.isInteger(tk) ? `${tk}` : tk.toFixed(1);
+        svg += `<text x="${m.l - 4}" y="${(yy + 3).toFixed(1)}" fill="${WHITE}" font-size="8" text-anchor="end">${tkLabel}</text>`;
       }
       // the 1.0x "redline" — prominent (solid amber, thicker) so it reads clearly
       // against the white trace; above it you burn faster than the clock.
@@ -2643,38 +2705,22 @@ EOF
 
 echo "  wrote claude_developer_debug.js"
 
-# ─── package the unpacked folder into a local .zip (+ .xpi) ───────────────────
-# Runs on every execution so you always get a distributable archive next to the
-# folder. Prefers web-ext (proper MV3 packaging); falls back to `zip`, then to
-# python's zipfile, so the archive is produced even without npm/web-ext.
+# ─── package the unpacked folder into a .zip + .xpi via web-ext ──────────────
+# Preflight already verified that web-ext is callable, so this is unconditional.
+# `web-ext build` runs manifest validation — a clean build means the package
+# is well-formed and ready for install.
 ZIPDIR="web-ext-artifacts"
 mkdir -p "$ZIPDIR"
-VER="$(grep -o '"version"[^,]*' "$EXTDIR/manifest.json" | grep -o '[0-9][0-9.]*' || true)"
-VER="${VER:-1.0}"
-ZIP=""
-if command -v web-ext >/dev/null 2>&1; then
-  echo "  packaging with web-ext..."
-  if web-ext build --source-dir "$EXTDIR" --artifacts-dir "$ZIPDIR" --overwrite-dest >/dev/null 2>&1; then
-    ZIP="$(ls -t "$ZIPDIR"/*.zip 2>/dev/null | head -1 || true)"
-  fi
+echo "  packaging with web-ext (version $WEBEXT_VER)..."
+if ! web-ext build --source-dir "$EXTDIR" --artifacts-dir "$ZIPDIR" --overwrite-dest >/dev/null; then
+  echo "ERROR: 'web-ext build' failed. Check $EXTDIR/manifest.json for validation errors:" >&2
+  echo "   web-ext lint --source-dir $EXTDIR" >&2
+  exit 1
 fi
+ZIP="$(ls -t "$ZIPDIR"/*.zip 2>/dev/null | head -1 || true)"
 if [ -z "$ZIP" ]; then
-  [ -x "$(command -v web-ext || true)" ] || echo "  web-ext not available — using a plain zip fallback"
-  ZIP="$ZIPDIR/claude_developer_debug-${VER}.zip"
-  rm -f "$ZIP"
-  if command -v zip >/dev/null 2>&1; then
-    ( cd "$EXTDIR" && zip -q -r -X "../$ZIP" . )
-  else
-    python3 - "$EXTDIR" "$ZIP" <<'PY'
-import os, sys, zipfile
-src, out = sys.argv[1], sys.argv[2]
-with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
-    for root, _, files in os.walk(src):
-        for f in files:
-            full = os.path.join(root, f)
-            z.write(full, os.path.relpath(full, src))
-PY
-  fi
+  echo "ERROR: web-ext build reported success but produced no .zip in $ZIPDIR" >&2
+  exit 1
 fi
 # an .xpi is just the zip renamed; Firefox's "Install Add-on From File" wants .xpi
 XPI="${ZIP%.zip}.xpi"
@@ -2685,9 +2731,13 @@ echo ""
 
 cat <<INSTR
 
-Done. Unpacked extension ready at: $EXTDIR/
-  - manifest.json
-  - claude_developer_debug.js
+Done. Build artifacts ready:
+  Unpacked folder:  $EXTDIR/
+    - manifest.json
+    - claude_developer_debug.js
+  Packaged (built by web-ext):
+    - $ZIP
+    - $XPI    (same bytes; Firefox's "Install Add-on From File" wants .xpi)
 
 ------------------------------------------------------------------------------
 INSTALL - CHROME / EDGE (111+)
@@ -2718,6 +2768,18 @@ INSTALL - OPERA (Chromium-based; loads this unpacked extension directly)
   apply to it.
 
 ------------------------------------------------------------------------------
+INSTALL - FIREFOX: HOW LONG DOES IT LAST? (read first)
+------------------------------------------------------------------------------
+  Firefox extension lifetime depends entirely on the install path:
+    Temporary add-on . . . . . . . until you close Firefox (wiped on restart/crash)
+    Unsigned + pref off . . . . .  until you remove it; Nightly / Dev / ESR ONLY
+
+  Quick picker:
+    "Just poking for one session"           -> Temporary  (section below)
+    "I'm on Nightly/Dev Edition, sticky"    -> PATH B     (unsigned + pref off)
+    For signing / AMO distribution options: see browser_extension_signing.md
+
+------------------------------------------------------------------------------
 INSTALL - FIREFOX, TEMPORARY (any Firefox 128+, wiped on restart)
 ------------------------------------------------------------------------------
   1. Open  about:debugging  ->  "This Firefox"
@@ -2725,29 +2787,20 @@ INSTALL - FIREFOX, TEMPORARY (any Firefox 128+, wiped on restart)
   Disappears when Firefox closes. Fine for a quick look; NOT persistent.
 
 ------------------------------------------------------------------------------
-INSTALL - FIREFOX, PERSISTENT (survives restarts)
+INSTALL - FIREFOX, PERSISTENT (survives restarts, until you remove it)
 ------------------------------------------------------------------------------
   This script ALREADY built the package locally (above):
       $ZIPDIR/claude_developer_debug-<ver>.zip   and   ...-<ver>.xpi
-  But Release/Beta Firefox REFUSE unsigned add-ons for permanent install, so that
-  bare .xpi will not stick on stock Firefox. Pick ONE path:
-
-  PATH A - Self-sign via Mozilla AMO  (works on ALL Firefox, recommended)
-    cd $EXTDIR
-    # one-time: create API credentials at
-    #   https://addons.mozilla.org/developers/addon/api/key/
-    web-ext sign --channel=unlisted --api-key=YOUR_JWT_ISSUER --api-secret=YOUR_JWT_SECRET
-    # produces a SIGNED .xpi in web-ext-artifacts/  (channel=unlisted keeps it
-    # private to you - it is not published to the public AMO listing)
-    Then in Firefox:  about:addons  ->  gear icon  ->  "Install Add-on From File..."
-    ->  pick that signed .xpi.
+  Note: Release/Beta Firefox refuse unsigned add-ons for permanent install.
+  For signing options (AMO self-distribution or listed): see browser_extension_signing.md
 
   PATH B - Disable signature enforcement  (Developer Edition / Nightly / ESR ONLY)
     In  about:config  set  xpinstall.signatures.required = false
         (stock Release/Beta IGNORE this pref - Dev/Nightly/ESR only)
     Then  about:addons  ->  gear icon  ->  "Install Add-on From File..."
     ->  pick the  $ZIPDIR/claude_developer_debug-<ver>.xpi  this script just built.
-  An .xpi is just the .zip renamed; Firefox's file installer wants the .xpi name.
+    Stays installed until you remove it.
+    (An .xpi is just the .zip renamed; Firefox's file installer wants the .xpi name.)
 
 ------------------------------------------------------------------------------
 VERIFY IT WORKS

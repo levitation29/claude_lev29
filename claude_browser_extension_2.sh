@@ -7,11 +7,12 @@
 #   onto every claude.ai page. The HUD has three action icons and does nothing
 #   else (no network monitor, no audit/probe/histogram):
 #
-#     📝  With Settings ▸ General open, fetch command_2_preferences.notes from
-#         GitHub AT RUNTIME and fill "Instructions for Claude" with it. Nothing is
-#         baked in. It acts ONLY inside the open settings dialog and NEVER touches
-#         the chat composer; saves via the dialog's Save button if present, else
-#         blurs to autosave. (If Settings isn't open, it says so and does nothing.)
+#     📝  With Settings ▸ General open (modal OR full page), fetch
+#         command_2_preferences.notes from GitHub AT RUNTIME and fill "Instructions
+#         for Claude" with it. Nothing is baked in. It targets a <textarea> only
+#         (the chat composer is a contenteditable <div>, so it is NEVER touched);
+#         saves via the dialog's Save button if present, else blurs to autosave.
+#         (If Settings isn't open, it says so and does nothing.)
 #     🏷  With Settings ▸ Billing open, read the plan name into the HUD.
 #     📋  List the command shortcuts parsed from the fetched prefs (one per line);
 #         click one to insert it into the claude.ai composer. A command is any
@@ -23,6 +24,10 @@
 #   claude-hud2-extension/
 #     manifest.json     — Manifest V3 manifest (Chrome / Firefox)
 #     claude_hud2.js    — the HUD + the three actions
+#   web-ext-artifacts/
+#     *.zip             — packaged extension (built by `web-ext build`)
+#     *.xpi             — same bytes as the .zip; named .xpi so Firefox's
+#                         "Install Add-on From File..." accepts it
 #
 # WHY ISOLATED WORLD + host_permissions (not MAIN world)
 #   The 📝 action fetch()es the prefs from raw.githubusercontent.com. A MAIN-world
@@ -53,13 +58,15 @@
 #      private, or the path/branch/filename changes, 📝 reports
 #      "✗ fetch failed: HTTP 404" (or similar). Fix by editing PREFS_URL below.
 #      A private repo will NOT work — the content script sends no credentials.
-#   3. 📝/🏷 act only on an ALREADY-OPEN settings dialog (open Settings ▸ General
-#      or ▸ Billing yourself first). claude.ai does not reliably open Settings from
-#      a URL-hash change, so this build does not try to auto-open it. The matching
-#      is best-effort against claude.ai's CURRENT markup (open dialog → its
-#      textarea; Save button text/aria /save/i; plan text "<tier> plan"); if the
-#      DOM changes, the HUD status line says so, and 📝 only ever writes inside the
-#      settings dialog — NEVER the chat composer.
+#   3. 📝/🏷 act on the settings view you have OPEN (open Settings ▸ General or
+#      ▸ Billing yourself first); it works whether Settings renders as a modal or
+#      as a full page. claude.ai does not reliably open Settings from a URL-hash
+#      change, so this build does not try to auto-open it. Matching is best-effort
+#      against claude.ai's CURRENT markup (a <textarea> named/under "Instructions
+#      for Claude"; Save button text/aria /save/i; plan text "<tier> plan"); if the
+#      DOM changes, the HUD status line says so. 📝 only ever targets a <textarea>,
+#      and the chat composer is a contenteditable <div> — so it can NEVER write to
+#      the chat box.
 #   4. The 📋 command list is INFERRED from the prefs prose: a command is any
 #      backtick `token` or bold **token** that is a bare command id. It now tracks
 #      both markups (so bold-defined zip-project / unzip-project are caught), but a
@@ -76,16 +83,38 @@
 #      on the clipboard to paste manually.
 #
 # HOW TO RUN
-#   chmod +x claude_browser_extension_2.sh
-#   ./claude_browser_extension_2.sh
+#   Place claude_browser_preflight.sh in the SAME directory as this script.
+#   The shared preflight verifies that node + npm + web-ext are installed (and
+#   prints install instructions if not). Then:
+#
+#     chmod +x claude_browser_extension_2.sh claude_browser_preflight.sh
+#     ./claude_browser_extension_2.sh
+#
+#   On success this produces the unpacked folder, a packaged .zip, and an .xpi
+#   ready for direct install (see the FIREFOX install paths below).
+#
+# SEE ALSO
+#   browser_extension_signing.md (next to this script) — complete guide to
+#   Firefox signing and AMO distribution. Consult it for all signing options.
 #
 # INSTALL (Chrome 111+ / Firefox 109+ for MV3 host_permissions)
 #   Chrome:  chrome://extensions → enable Developer mode → Load unpacked →
 #            pick the claude-hud2-extension/ folder. Refresh claude.ai.
 #            (It will ask to read data on raw.githubusercontent.com — that is the
 #            prefs fetch.)
-#   Firefox: about:debugging#/runtime/this-firefox → Load Temporary Add-on →
-#            pick claude-hud2-extension/manifest.json. Refresh claude.ai.
+#   Firefox: choice of TWO install paths depending on how long you want it to last
+#            (Firefox treats add-ons very differently from Chrome here):
+#
+#       (1) TEMPORARY — about:debugging#/runtime/this-firefox → Load Temporary
+#           Add-on → pick claude-hud2-extension/manifest.json. Refresh claude.ai.
+#           Wiped when Firefox closes (also on crash). Good for one session.
+#       (2) PERMANENT, UNSIGNED — Nightly / Developer Edition / ESR ONLY
+#           about:config → xpinstall.signatures.required = false → about:addons →
+#           gear → "Install Add-on From File..." → the .xpi (zip renamed). Stays
+#           until you remove it. Stock Release/Beta IGNORE this pref.
+#
+#       For signing / AMO distribution options: see browser_extension_signing.md.
+#
 #   The "Claude HUD" panel appears top-right. Drag it; × hides it for the page
 #   (refresh claude.ai to bring it back — see CAVEAT 1 re: console helpers).
 #
@@ -101,6 +130,23 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# ─── preflight: required tooling ─────────────────────────────────────────────
+# Source the shared preflight (must sit next to this script). It hard-fails
+# (exit 1) if web-ext is missing, with install instructions for node/npm/web-ext.
+# On success it exports: PACKAGER, SIGNING_AVAILABLE, HAS_*, *_VER.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ ! -f "$HERE/claude_browser_preflight.sh" ]; then
+  cat >&2 <<EOF
+ERROR: claude_browser_preflight.sh not found next to this script.
+Expected at: $HERE/claude_browser_preflight.sh
+Put all three files (claude_browser_extension.sh, claude_browser_extension_2.sh,
+and claude_browser_preflight.sh) in the same directory and re-run.
+EOF
+  exit 1
+fi
+# shellcheck disable=SC1091
+. "$HERE/claude_browser_preflight.sh"
+
 EXTDIR="claude-hud2-extension"
 echo "Creating extension folder: $EXTDIR/"
 mkdir -p "$EXTDIR"
@@ -109,11 +155,17 @@ mkdir -p "$EXTDIR"
 # host_permissions lets the isolated content script fetch the prefs from GitHub
 # (CORS-bypassed, not subject to claude.ai's CSP). No "world":"MAIN".
 # browser_specific_settings.gecko lets Firefox load it; Chrome ignores that key.
+#   .id                              — Stable, explicit add-on ID. Required for
+#                                      AMO signing (see browser_extension_signing.md).
+#   .data_collection_permissions     — Required by AMO (since 2025-11-03). Value
+#                                      ["none"] declares no personal data collected
+#                                      (truthful — the prefs fetch sends no browser
+#                                      data). Firefox shows this at install time.
 cat > "$EXTDIR/manifest.json" << 'MANIFEST_EOF'
 {
   "manifest_version": 3,
   "name": "Claude HUD 2 — Actions",
-  "version": "2.6",
+  "version": "2.8",
   "description": "A minimal draggable HUD on claude.ai with three action icons: with Settings ▸ General open, fill the Instructions box from GitHub (dialog-scoped); with Settings ▸ Billing open, read the plan name; and list command shortcuts that insert into the composer.",
   "host_permissions": ["https://raw.githubusercontent.com/*"],
   "content_scripts": [
@@ -124,7 +176,11 @@ cat > "$EXTDIR/manifest.json" << 'MANIFEST_EOF'
     }
   ],
   "browser_specific_settings": {
-    "gecko": { "id": "claude-hud2@local", "strict_min_version": "109.0" }
+    "gecko": {
+      "id": "claude-hud2@local",
+      "strict_min_version": "109.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
   }
 }
 MANIFEST_EOF
@@ -188,19 +244,35 @@ cat > "$EXTDIR/claude_hud2.js" << 'JS_EOF'
 
   // ── action 1: fetch prefs, clear + paste into the instructions box, then save
   function findInstructionsBox() {
-    const dialogs = openDialogs();          // only inside a real open settings modal
-    for (let i = 0; i < dialogs.length; i++) {
-      const tas = [].slice.call(dialogs[i].querySelectorAll('textarea'))
+    // The chat composer is a contenteditable <div>, NEVER a <textarea> — so
+    // scanning textareas can't hit it. Settings can render as a modal OR a full
+    // page, so look inside an open dialog first, else the whole document.
+    const dialogs = openDialogs();
+    const scopes = dialogs.length ? dialogs : [document];
+    for (let i = 0; i < scopes.length; i++) {
+      const tas = [].slice.call(scopes[i].querySelectorAll('textarea'))
                     .filter(function (t) { return t.offsetParent !== null; });
-      const named = tas.find(function (t) {
+      if (!tas.length) continue;
+      // 1) textarea whose own attributes name it
+      const byAttr = tas.find(function (t) {
         const hay = (t.placeholder || '') + ' ' + (t.getAttribute('aria-label') || '') +
                     ' ' + (t.name || '') + ' ' + (t.id || '');
-        return /instruction|claude/i.test(hay);
+        return /instruction/i.test(hay);
       });
-      if (named) return named;
-      if (tas.length === 1) return tas[0];   // lone textarea in an open dialog = the box
+      if (byAttr) return byAttr;
+      // 2) textarea sitting under an "Instructions for Claude" heading/label
+      const byLabel = tas.find(function (t) {
+        let el = t.parentElement;
+        for (let up = 0; up < 5 && el; up++, el = el.parentElement) {
+          if (/instructions for claude/i.test(el.textContent || '')) return true;
+        }
+        return false;
+      });
+      if (byLabel) return byLabel;
+      // 3) lone visible textarea in scope = the box
+      if (tas.length === 1) return tas[0];
     }
-    return null;   // no open dialog → do nothing (never the chat composer)
+    return null;   // nothing that looks like the instructions box
   }
   function clickSaveIn(scope) {
     const btns = [].slice.call((scope || document).querySelectorAll('button, [role="button"]'))
@@ -228,7 +300,8 @@ cat > "$EXTDIR/claude_hud2.js" << 'JS_EOF'
     const scope = box.closest('[role="dialog"], [aria-modal="true"]') || document;
     box.blur();                                  // "click outside" -> autosave
     const saved = clickSaveIn(scope);
-    return '\u2713 wrote ' + prefs.length + ' chars (from GitHub)' +
+    const nbytes = new TextEncoder().encode(prefs).length;   // UTF-8 bytes = wc -c
+    return '\u2713 wrote ' + nbytes + ' bytes (from GitHub)' +
            (saved ? ' + clicked Save' : ' \u2014 blurred to autosave');
   }
 
@@ -469,11 +542,39 @@ cat > "$EXTDIR/claude_hud2.js" << 'JS_EOF'
 JS_EOF
 echo "  wrote claude_hud2.js"
 
+# ─── package the unpacked folder into a .zip + .xpi via web-ext ──────────────
+# Preflight already verified that web-ext is callable, so this is unconditional.
+# `web-ext build` runs manifest validation — a clean build means the package
+# is well-formed and ready for install.
+ZIPDIR="web-ext-artifacts"
+mkdir -p "$ZIPDIR"
+echo "  packaging with web-ext (version $WEBEXT_VER)..."
+if ! web-ext build --source-dir "$EXTDIR" --artifacts-dir "$ZIPDIR" --overwrite-dest >/dev/null; then
+  echo "ERROR: 'web-ext build' failed. Check $EXTDIR/manifest.json for validation errors:" >&2
+  echo "   web-ext lint --source-dir $EXTDIR" >&2
+  exit 1
+fi
+ZIP="$(ls -t "$ZIPDIR"/*.zip 2>/dev/null | head -1 || true)"
+if [ -z "$ZIP" ]; then
+  echo "ERROR: web-ext build reported success but produced no .zip in $ZIPDIR" >&2
+  exit 1
+fi
+# an .xpi is just the zip renamed; Firefox's "Install Add-on From File" wants .xpi
+XPI="${ZIP%.zip}.xpi"
+cp -f "$ZIP" "$XPI"
+echo "  built package: $ZIP"
+echo "  built package: $XPI  (identical bytes; .xpi is for Firefox file-install)"
+echo ""
+
 cat <<INSTR
 
-Done. Unpacked extension ready at: $EXTDIR/
-  - manifest.json
-  - claude_hud2.js
+Done. Build artifacts ready:
+  Unpacked folder:  $EXTDIR/
+    - manifest.json
+    - claude_hud2.js
+  Packaged (built by web-ext):
+    - $ZIP
+    - $XPI    (same bytes; Firefox's "Install Add-on From File" wants .xpi)
 
 ------------------------------------------------------------------------------
 INSTALL — CHROME / EDGE / OPERA / BRAVE (Chromium 111+)
@@ -492,6 +593,18 @@ INSTALL — CHROME / EDGE / OPERA / BRAVE (Chromium 111+)
    "Install Chrome Extensions" add-on is only for the Chrome Web Store.)
 
 ------------------------------------------------------------------------------
+INSTALL — FIREFOX: HOW LONG DOES IT LAST? (read first)
+------------------------------------------------------------------------------
+  Firefox extension lifetime depends entirely on the install path:
+    Temporary add-on . . . . . . . until you close Firefox (wiped on restart/crash)
+    Unsigned + pref off . . . . .  until you remove it; Nightly / Dev / ESR ONLY
+
+  Quick picker:
+    "Just poking for one session"           -> Temporary  (section below)
+    "I'm on Nightly/Dev Edition, sticky"    -> PATH B     (unsigned + pref off)
+    For signing / AMO distribution options: see browser_extension_signing.md
+
+------------------------------------------------------------------------------
 INSTALL — FIREFOX, TEMPORARY (Firefox 109+, wiped on restart)
 ------------------------------------------------------------------------------
   1. Open  about:debugging  ->  "This Firefox".
@@ -500,17 +613,20 @@ INSTALL — FIREFOX, TEMPORARY (Firefox 109+, wiped on restart)
      NOT persistent).
 
 ------------------------------------------------------------------------------
-INSTALL — FIREFOX, PERSISTENT (survives restarts)
+INSTALL — FIREFOX, PERSISTENT (survives restarts, until you remove it)
 ------------------------------------------------------------------------------
-  This script builds only the UNPACKED folder; stock Firefox Release/Beta refuse
-  unsigned add-ons for permanent install. To make it stick:
-    cd $EXTDIR
-    # one-time: API key at https://addons.mozilla.org/developers/addon/api/key/
-    web-ext sign --channel=unlisted --api-key=YOUR_JWT_ISSUER --api-secret=YOUR_JWT_SECRET
-    # -> a SIGNED .xpi in web-ext-artifacts/ (unlisted = private to you)
-  Then Firefox  about:addons  ->  gear  ->  "Install Add-on From File..."  ->  the .xpi.
-  (Developer Edition / Nightly / ESR only: set xpinstall.signatures.required=false
-   in about:config, then install the folder zipped + renamed to .xpi directly.)
+  This script ALREADY built the package locally (above):
+      $ZIP   and   $XPI
+  Note: Release/Beta Firefox refuse unsigned add-ons for permanent install.
+  For signing options (AMO self-distribution or listed): see browser_extension_signing.md
+
+  PATH B - Disable signature enforcement  (Developer Edition / Nightly / ESR ONLY)
+    In  about:config  set  xpinstall.signatures.required = false
+        (stock Release/Beta IGNORE this pref - Dev/Nightly/ESR only)
+    Then  about:addons  ->  gear  ->  "Install Add-on From File..."
+    ->  pick the  $XPI  this script just built.
+    Stays installed until you remove it.
+    (An .xpi is just the .zip renamed; Firefox's file installer wants the .xpi name.)
 
 ------------------------------------------------------------------------------
 VERIFY IT WORKS
