@@ -58,7 +58,7 @@ else
   printf 'wall-clock - session   : 0h 00m 00s  (no restart yet: this container has been up since the chat opened)\n'
 fi
 if [ -n "$lastc" ]; then
-  printf 'compaction − session   : %dh %02dm %02ds  (last compaction was this long before the current boot; +/- => reboot since/before compaction)\n' $(( (b-lastc)/3600 )) $(( ((b-lastc)%3600)/60 )) $(( (b-lastc)%60 ))
+  printf 'compaction - session   : %dh %02dm %02ds  (last compaction was this long before the current boot; +/- => reboot since/before compaction)\n' $(( (b-lastc)/3600 )) $(( ((b-lastc)%3600)/60 )) $(( (b-lastc)%60 ))
 fi
 echo
 echo 'note: the Claude debug HUD session time anchors at the browser conversation start,'
