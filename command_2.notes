@@ -78,27 +78,28 @@ Operate on a plan document: review, simplify, or score. Some make edits; most do
 Inspect directories, list mtimes, or touch session-anchor files. Side-effecting on disk.
 
 **showskillfs** – 
-ls -la /mnt/skills/public/ ; 
-ls -la /mnt/skills/examples/ ; 
-ls -la /mnt/skills/user/ ; 
+ls -la /mnt/skills/public/    2>/dev/null || echo "(none)" ; 
+ls -la /mnt/skills/examples/  2>/dev/null || echo "(none)" ; 
+ls -la /mnt/skills/user/      2>/dev/null || echo "(none)" ; 
 
 **showtranscriptfs** – 
-ls -la /mnt/transcripts/ ; 
+ls -la /mnt/transcripts/ 2>/dev/null || echo "(none)" ; 
 
 **showprojectfs** – 
-ls -la /mnt/project
+ls -la /mnt/project 2>/dev/null || echo "(none)"
 
 **showuserfs** – 
-ls -la /home/claude/ ; 
-ls -la /mnt/user-data/outputs/ ; 
-ls -la /mnt/user-data/uploads/ ; 
-ls -la /mnt/user-data/tool_results ;
+ls -la /home/claude/              2>/dev/null || echo "(none)" ; 
+ls -la /mnt/user-data/outputs/    2>/dev/null || echo "(none)" ; 
+ls -la /mnt/user-data/uploads/    2>/dev/null || echo "(none)" ; 
+ls -la /mnt/user-data/tool_results 2>/dev/null || echo "(none)" ;
 
 **showmyfs** – 
 showuserfs ;
 showskillfs ;
 showtranscriptfs ;
 showprojectfs ;
+(Every ls is guarded with `2>/dev/null || echo "(none)"` so a missing dir — e.g. /mnt/skills/user/ when no user skills exist — prints "(none)" instead of returning nonzero. This matters because showmyfs is also called as the trailing step of flatten.sh, which runs under `set -e`: an unguarded `ls` on an absent dir would trip the error trap and abort the script AFTER the merge already succeeded, emitting a confusing failure. The guard keeps showmyfs safe to invoke from inside any `set -e` context.)
 
 **mtime_output** – for f in /mnt/user-data/outputs/*; do echo "$f $(TZ='America/Denver' date -d @$(stat -c '%Y' "$f") +'%Y-%m-%d %H:%M:%S %Z')"; done
 **mtime_claude** – for f in /home/claude/*; do echo "$f $(TZ='America/Denver' date -d @$(stat -c '%Y' "$f") +'%Y-%m-%d %H:%M:%S %Z')"; done
@@ -232,4 +233,4 @@ Continuity across a fresh chat. `resume_seed` (write, at end of a session) recor
 
 ## Session resume, but around unzipping of files to /mnt/project
 **zip-project** — build a downloadable, versioned project export (the OUTPUT side; `unzip-project` + `flatten.sh` are the INPUT side). Runs `scripts/make_export.sh` per `create_zip_by_tiers.md` §7: classifies every file via `export_rules.conf` using `scripts/check_export_rules.sh` (which flags UNMATCHED / AMBIGUOUS), stages tier1/2/3 atomically in a tmp tree, gates (no UNMATCHED; non-empty tier1; packed zip_version == N), refuses N ≤ last seen, writes a README with archiveHash + sessionNonce, and emits `meehan_project_export_<DATE>_v<N>.zip` to /mnt/user-data/outputs/. Preview with `make_export.sh --dry-run`, or validate classification with `check_export_rules.sh <roots>`, before the real build. Exits 0/1/2. (Reminder: producing the zip does not persist anything — the human downloads it and re-uploads via the UI; LOADING_AND_PERSISTENCE.md.)
-**unzip-project** — (1) Scan /mnt/user-data/uploads/ for *_YYYY-MM-DD_v<N>.zip; select most recent by date, highest _v<N> as tiebreaker. (2) If /mnt/project/ is non-empty: warn and ask — wipe (delete all first) or overwrite (same paths only)? If overwrite: list all paths inside the zip; if any file's relative path differs only in top-level folder from an existing file in /mnt/project/ with the same basename → abort with conflict report. (3) Confirm: "Unzip <file> to /mnt/project/ [wipe first / overwrite]?" — await y/n. (4) On y: wipe if chosen (rm -rf /mnt/project/*), then unzip -o <path> -d /mnt/project/. (5) If the tiers landed under a single top-level wrapper dir (i.e. /mnt/project/<wrapper>/tier1_live_state/... rather than /mnt/project/tier1_live_state/...) — the usual case, since the export carries its own folder — note that `resume` expects files flat at /mnt/project/<store_as> then RUN `flatten.sh here --yes` to flatten the tiers into /mnt/project (the unified flattener; replaces the old flatten_v.sh + flatten_mnt_project.sh — tier-merges the export into /mnt/project/: tier1 contents + tier2 WHOLE-DIR (root .md specs to /mnt/project/ root, scripts/ and narrative/ as subdirs) + tier3 contents; overwrite-same-name, never delete; prompts before removing the emptied wrapper; ends with showmyfs). The flatten runs automatically as the final import step — unzip-project does the whole import. (6) showmyfs (printed by the flatten).
+**unzip-project** — (1) Scan /mnt/user-data/uploads/ for *_YYYY-MM-DD_v<N>.zip; select most recent by date, highest _v<N> as tiebreaker. FALLBACK: if uploads/ has no matching zip, scan /home/claude/ for *_YYYY-MM-DD_v<N>.zip with the same most-recent-date / highest-_v<N> rule and use that (this is the zip a `pull` just landed in the sandbox — so `pull` then `unzip-project` works with no re-upload); uploads/ still wins if both have a match. If neither location has a match, stop and say so. (2) If /mnt/project/ is non-empty: warn and ask — wipe (delete all first) or overwrite (same paths only)? If overwrite: list all paths inside the zip; if any file's relative path differs only in top-level folder from an existing file in /mnt/project/ with the same basename → abort with conflict report. (3) Confirm: "Unzip <file> to /mnt/project/ [wipe first / overwrite]?" — await y/n. (4) On y: wipe if chosen (rm -rf /mnt/project/*), then unzip -o <path> -d /mnt/project/. (5) If the tiers landed under a single top-level wrapper dir (i.e. /mnt/project/<wrapper>/tier1_live_state/... rather than /mnt/project/tier1_live_state/...) — the usual case, since the export carries its own folder — note that `resume` expects files flat at /mnt/project/<store_as> then RUN `flatten.sh here --yes` to flatten the tiers into /mnt/project (the unified flattener; replaces the old flatten_v.sh + flatten_mnt_project.sh — tier-merges the export into /mnt/project/: tier1 contents + tier2 WHOLE-DIR (root .md specs to /mnt/project/ root, scripts/ and narrative/ as subdirs) + tier3 contents; overwrite-same-name, never delete; prompts before removing the emptied wrapper; ends with showmyfs). The flatten runs automatically as the final import step — unzip-project does the whole import. (6) showmyfs (printed by the flatten).
